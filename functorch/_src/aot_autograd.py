@@ -1742,6 +1742,8 @@ def aot_module_simplified(
     """
     #########################################################
 
+    torch._dynamo.utils.assert_no_fake_params_or_buffers(mod)
+
     params = {
         **dict(_named_parameters(mod, remove_duplicate=False)),
         **dict(_named_buffers(mod, remove_duplicate=False)),
