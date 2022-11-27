@@ -1,6 +1,8 @@
 import contextlib
 
 import warnings
+import threading
+
 from torch._C import _len_torch_dispatch_stack, _get_dispatch_stack_at,\
     _pop_torch_dispatch_stack, _push_on_torch_dispatch_stack
 
@@ -67,11 +69,22 @@ def _get_current_dispatch_mode_stack():
     return [_get_dispatch_stack_at(i) for i in range(stack_len)]
 
 def _push_mode(mode):
+    if not hasattr(mode, "tracking"):
+        mode.tracking = threading.local()
+    else:
+        if hasattr(mode.tracking, "on_stack"):
+            assert mode.tracking.on_stack is False, "Illegal attempt to push an already pushed mode onto the stack"
+
+    mode.tracking.on_stack = True
     _push_on_torch_dispatch_stack(mode)
 
 
 def _pop_mode():
-    return _pop_torch_dispatch_stack()
+    mode = _pop_torch_dispatch_stack()
+    assert hasattr(mode, "tracking"), "Unexpected, popping a mode we are not tracking"
+    assert mode.tracking.on_stack is True, "Unexpected, popping a mode that thinks its already off the stack"
+    mode.tracking.on_stack = False
+    return mode
 
 
 @contextlib.contextmanager
