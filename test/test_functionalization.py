@@ -28,8 +28,6 @@ def are_aliased(x, y):
 # This is basically a crappy version of `functionalize()` for single-tensor-arg inputs.
 def _functionalize(f, *, reapply_views: bool, crossref: bool):
     def wrapped(*inputs):
-        # if not isinstance(inputs, list) and not isinstance(inputs, tuple):
-        #     inputs = [inputs]
         ctx = nullcontext()
         if crossref:
             ctx = enable_crossref_functionalize()
@@ -76,7 +74,7 @@ class TestFunctionalization(TestCase):
         if not isinstance(inpts, list) and not isinstance(inpts, tuple):
             inpts = [inpts]
         clones = [inpt.clone() for inpt in inpts]
-        
+
         # Compare outputs (and mutated inputs), with and without functionalization.
         out_ref = func(*inpts)
         out_functional = _functionalize(func, reapply_views=reapply_views, crossref=self.crossref)(*clones)
@@ -1225,6 +1223,7 @@ def forward(self, arg0_1):
 
     def test_instance_norm(self):
         size = 100
+
         def f(x, running_mean, running_var):
             with enable_python_dispatcher():
                 return torch.instance_norm(x, None, None, running_mean, running_var,
