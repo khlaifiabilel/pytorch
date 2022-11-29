@@ -138,6 +138,7 @@ class ConvUnary2d(nn.Conv2d):
                 self.attr,
                 self.scalars,
                 self.algorithm,
+                0,
             )
         return torch.ops.mkldnn._convolution_pointwise(
             input,
@@ -150,6 +151,7 @@ class ConvUnary2d(nn.Conv2d):
             self.attr,
             self.scalars,
             self.algorithm,
+            0,
         )
 
     def forward(self, input):
@@ -220,6 +222,7 @@ class ConvBinary2d(nn.Conv2d):
                 self.unary_attr,
                 self.unary_scalars,
                 self.unary_algorithm,
+                0,
             )
         return torch.ops.mkldnn._convolution_pointwise(
             input,
@@ -235,6 +238,7 @@ class ConvBinary2d(nn.Conv2d):
             self.unary_attr,
             self.unary_scalars,
             self.unary_algorithm,
+            0,
         )
 
     def forward(self, input, other):
