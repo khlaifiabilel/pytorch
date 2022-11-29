@@ -959,9 +959,17 @@ def prelu(a: TensorLikeType, weight: TensorLikeType) -> TensorLikeType:
         lambda: f"prelu: Expected `weight` to be a scalar or 1D tensor, but got: "
         f"ndim = {weight.ndim}",
     )
-    weight = prims.broadcast_in_dim(
-        weight, a.shape, tuple() if weight.ndim == 0 else (1,)
-    )
+    if a.ndim == 0:
+        # NB: This diverges from the current prelu which actually allows this case
+        #     but we don't allow this for now just to avoid regressing nvfuser support
+        check(
+            weight.ndim == 0,
+            lambda: f"prelu: Expected `a` to be at least a 1D tensor when `weight` is not a scalar"
+        )
+    else:
+        weight = prims.broadcast_in_dim(
+            weight, a.shape, tuple() if weight.ndim == 0 else (0 if a.ndim == 1 else 1,)
+        )
 
     return refs.where(a > 0, a, a * weight)
 
