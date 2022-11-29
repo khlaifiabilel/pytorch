@@ -10,11 +10,10 @@ from torch.distributed._shard.sharded_tensor.api import ShardedTensor
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 from torch.distributed._tensor import (
-    distribute_tensor,
     DeviceMesh,
     DTensor as DT,
-    Shard,
     Replicate,
+    Shard,
 )
 from torch.distributed._tensor.parallel import (
     PairwiseParallel,
@@ -52,67 +51,28 @@ class SimpleModel(torch.nn.Module):
         return x
 
 
-def _aggregate_local_tensor(module: torch.nn.Module) -> torch.nn.Module:
-    def hook_func(_module, _input, output):
-        if isinstance(output, DT):
-            replica_placement = [Replicate()]
-            return output.redistribute(
-                output.device_mesh, replica_placement
-            ).to_local()
-
-    module.register_forward_hook(hook_func)
-    return module
-
-
-def _replicate_input_tensor(
-    module: torch.nn.Module, device_mesh, replica_placement
-) -> torch.nn.Module:
-    def hook_func(_, input):
-        if not isinstance(input[0], DT):
-            return DT.from_local(
-                input[0], device_mesh, replica_placement, run_check=False
-            )
-
-    module.register_forward_pre_hook(hook_func)
-    return module
-
-
-def shard_module(m, pg):
-    start_idx = distributed_c10d.get_global_rank(pg, 0)
-    device_mesh = DeviceMesh(
-        "cuda", list(range(start_idx, start_idx + pg.size())), dim_groups=[pg]
-    )
-    col_wise_sharding = [Shard(0)]
-    row_wise_sharding = [Shard(1)]
-    replicate = [Replicate()]
-    m.net1.weight = torch.nn.Parameter(
-        distribute_tensor(m.net1.weight, device_mesh, col_wise_sharding),
-    )
-    m.net2.weight = torch.nn.Parameter(
-        distribute_tensor(m.net2.weight, device_mesh, row_wise_sharding)
-    )
-    m.net1.bias = torch.nn.Parameter(
-        distribute_tensor(m.net1.bias, device_mesh, col_wise_sharding)
-    )
-    m.net2.bias = torch.nn.Parameter(
-        distribute_tensor(m.net2.bias, device_mesh, replicate)
-    )
-    m = _replicate_input_tensor(m, device_mesh, replicate)
-    m.net2 = _aggregate_local_tensor(m.net2)
-
-
-def _shard_wrap_module(module, module_shard, fsdp_wrap, mesh_2d, fsdp_pg):
+def _shard_wrap_module(
+    module, module_shard, fsdp_wrap, mesh_2d, fsdp_pg, use_orig_params
+):  
+    device_mesh_1d = None
     if module_shard:
-        parallelize_module(module, mesh_2d, PairwiseParallel(), tp_mesh_dim=1)
+        module = parallelize_module(module, mesh_2d, PairwiseParallel(), tp_mesh_dim=1)
+        device_mesh_1d = module.net1.weight.device_mesh
 
     if fsdp_wrap and module_shard:
-        return FSDP(module, process_group=fsdp_pg)
+        return FSDP(
+            module, process_group=fsdp_pg, use_orig_params=use_orig_params
+        ), device_mesh_1d
     if fsdp_wrap:
-        return FSDP(module, process_group=distributed_c10d._get_default_group())
-    return module
+        return FSDP(
+            module,
+            process_group=distributed_c10d._get_default_group(),
+            use_orig_params=use_orig_params,
+        ), device_mesh_1d
+    return module, device_mesh_1d
 
 
-def init_model(model_parallel_size=TP_DEGREE):
+def init_model(model_parallel_size=TP_DEGREE, use_orig_params=False):
     rank = dist.get_rank()
     torch.cuda.set_device(rank)
     world_size = dist.get_world_size()
@@ -128,8 +88,10 @@ def init_model(model_parallel_size=TP_DEGREE):
     fsdp_pg = twod_mesh.get_dim_groups()[0]
 
     # Create Input
-    model = _shard_wrap_module(model, True, True, twod_mesh, fsdp_pg)
-    return model, fsdp_pg
+    model, device_mesh_1d = _shard_wrap_module(
+        model, True, True, twod_mesh, fsdp_pg, use_orig_params
+    )
+    return model, fsdp_pg, device_mesh_1d
 
 
 def is_nested_tensor(val: Any) -> bool:
@@ -182,19 +144,53 @@ class Test2dParallelIntegration(DTensorTestBase):
             is_nested_tensor(optim_state["state"]["net3.bias"]["exp_avg"])
         )
 
-    @with_comms
-    @skip_if_lt_x_gpu(4)
-    def test_2d_fsdp_integration_correctness(self) -> None:
+    def _compare_params(self, m1, m2, device_mesh_1d, use_orig_params):
+        with FSDP.summon_full_params(m1):
+            with FSDP.summon_full_params(m2):
+                for n_p1, n_p2 in zip(m1.named_parameters(), m2.named_parameters()):
+                    p1 = n_p1[1]
+                    p2 = n_p2[1]
+                    self.assertEqual(n_p1[0], n_p2[0])
+                    name = n_p1[0]
+                    if name == "net2.bias" and self.rank != 0:
+                        continue
+                    if use_orig_params:
+                        p1 = p1.data
+                        p2 = p2.data
+                    if "net1" in name:
+                        spec = [Shard(0)]
+                    elif name == "net2.weight":
+                        spec = [Shard(1)]
+                    else:
+                        spec = [Replicate()]
+                    if type(p2) is DT:
+                        p2 = p2.redistribute(
+                            device_mesh_1d, [Replicate()]
+                        ).to_local()
+                    # elif name != "net2.bias":
+                    #     p2 = DT.from_local(p2, device_mesh_1d, spec).redistribute(
+                    #        device_mesh_1d, [Replicate()] 
+                    #     ).to_local()
+                    # print(name, p1.size(), p2.size(), spec)
+                    self.assertTrue(torch.allclose(p1, p2), f"{p1} vs {p2}")
+
+    def _test_2d_e2e_flow(self, use_orig_params=False) -> None:
         if not is_available():
             self.skipTest("FSDP 2d parallel integration not available")
         torch.manual_seed(0)
         model = SimpleModel().cuda(self.rank)
-        model = FSDP(model)
+        model = FSDP(model, use_orig_params=use_orig_params)
         torch.manual_seed(0)
-        model_2d, dp_pg = init_model()
+        model_2d, dp_pg, device_mesh_1d = init_model(use_orig_params=use_orig_params)
+        # Check named parameters are returning the same name at least.
+        param_names_2d = [name for name, _ in model_2d.named_parameters()]
+        for name, p in model.named_parameters():
+            self.assertTrue(name in param_names_2d)
+        self._compare_params(model, model_2d, device_mesh_1d, use_orig_params)
 
         optim = torch.optim.Adam(model.parameters(), lr=0.0001)
         optim_2d = torch.optim.Adam(model_2d.parameters(), lr=0.0001)
+        return
 
         for i in range(5):
             # Ensure all input across TP ranks are same.
@@ -208,6 +204,19 @@ class Test2dParallelIntegration(DTensorTestBase):
             optim.step()
             optim_2d.step()
             self.assertEqual(model(input), model_2d(input))
+        
+        # Ensure all params are still the same after optimizer update.
+        self._compare_params(model, model_2d, device_mesh_1d, use_orig_params)
+
+    @with_comms
+    @skip_if_lt_x_gpu(4)
+    def test_2d_fsdp_integration_correctness(self) -> None:
+        self._test_2d_e2e_flow()
+
+    @with_comms
+    @skip_if_lt_x_gpu(4)
+    def test_2d_fsdp_integration_use_orig_params(self) -> None:
+        self._test_2d_e2e_flow(use_orig_params=True)
 
 
 if __name__ == "__main__":
