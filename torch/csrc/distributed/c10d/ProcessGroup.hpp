@@ -1,5 +1,6 @@
 #pragma once
 
+#include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -10,12 +11,7 @@
 #include <ATen/ATen.h>
 #include <c10/macros/Macros.h>
 
-#include <torch/csrc/distributed/c10d/Types.hpp>
-#include <torch/csrc/distributed/c10d/Utils.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
-#include <torch/csrc/distributed/c10d/debug.h>
-#include <torch/csrc/distributed/c10d/sequence_num.hpp>
-
 // *************************************************************************
 // PROCESS GROUP collective communication API IS BEING CHANGED BETWEEN
 // versions 1.7 and 1.8.
@@ -67,7 +63,20 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
     const std::string backend;
   };
 
+  enum BackendType {
+    UNDEFINED = 0,
+    GLOO = 1,
+    NCCL = 2,
+    UCC = 3,
+    MPI = 4,
+    TCP = 5,
+    CUSTOM = 6,
+  };
+
+  // Not used, set for backwards compatibility and only used for TypeDef in Ops.cpp
   explicit ProcessGroup(int rank, int size);
+
+  explicit ProcessGroup(const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size, c10::intrusive_ptr<Options> options);
   virtual ~ProcessGroup();
 
   int getRank() const {
@@ -78,9 +87,8 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
     return size_;
   }
 
-  // Subclasses must override this method to return the backend name
   virtual const std::string getBackendName() const {
-    TORCH_INTERNAL_ASSERT(false, "getBackendName is not implemented.");
+    return options_->backend;
   };
 
   virtual void startCoalescing() {
@@ -260,6 +268,18 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
   // for GLOO and NCCL backends currently.
   virtual void setSequenceNumberForGroup() {
     auto backendName = getBackendName();
+
+    // TODO: HACK for backend name to get sequence number for that backend.
+    if (backendName == "gloo") {
+      backendTypeToBackend_.at(ProcessGroup::BackendType::GLOO)->setSequenceNumberForGroup();
+    }
+    else if (backendName == "nccl") {
+      backendTypeToBackend_.at(ProcessGroup::BackendType::NCCL)->setSequenceNumberForGroup();
+    }
+    else if (backendName == "ucc") {
+      backendTypeToBackend_.at(ProcessGroup::BackendType::UCC)->setSequenceNumberForGroup();
+    }
+
     TORCH_CHECK(
         false,
         c10::str(
@@ -273,6 +293,18 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
   // may indicate that there is some sort of collective desynchronization.
   virtual uint64_t getSequenceNumberForGroup() {
     auto backendName = getBackendName();
+
+    // TODO: HACK for backend name to get sequence number for that backend.
+    if (backendName == "gloo") {
+      return backendTypeToBackend_.at(ProcessGroup::BackendType::GLOO)->getSequenceNumberForGroup();
+    }
+    else if (backendName == "nccl") {
+      return backendTypeToBackend_.at(ProcessGroup::BackendType::NCCL)->getSequenceNumberForGroup();
+    }
+    else if (backendName == "ucc") {
+      return backendTypeToBackend_.at(ProcessGroup::BackendType::UCC)->getSequenceNumberForGroup();
+    }
+
     TORCH_CHECK(
         false,
         c10::str(
@@ -318,18 +350,49 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
             "ProcessGroup ", getBackendName(), " does not support barrier"));
   }
 
+  bool hasBackends() {
+    return !deviceTypeToBackendType_.empty();
+  }
+
+  void setBackend(c10::DeviceType deviceType, BackendType backendType, const c10::intrusive_ptr<Backend>& backend) {
+    deviceTypeToBackendType_[deviceType] = backendType;
+    deviceTypeToBackend_[deviceType] = backend;
+    backendTypeToBackend_[backendType] = backend;
+  }
+
+  c10::intrusive_ptr<Backend> getBackend(c10::DeviceType deviceType) const;
+
+  c10::intrusive_ptr<Backend> getBackend(BackendType backendType) const {
+    TORCH_CHECK(
+        backendTypeToBackend_.find(backendType) != backendTypeToBackend_.end(),
+        "Could not find backend type ",
+        backendType,
+        ".");
+    return backendTypeToBackend_.at(backendType);
+  }
+
  protected:
+  void createBackends();
+
   // Implementations of this interface need to call this to setup
   // appropriate logging etc.
   void init();
 
+  const c10::intrusive_ptr<c10d::Store> store_;
   const int rank_;
   const int size_;
+  const c10::intrusive_ptr<Options> options_;
   // Optional sequence number structure for matching collectives.
   c10::optional<c10d::SequenceNum> sequenceNum_ = c10::nullopt;
+
   // Debug level setting. It is parsed once when ProcessGroup is constructed and
   // remains the same across use of this process group.
   DebugLevel dist_debug_level_;
+
+  // Backend classes for this ProcessGroup
+  std::unordered_map<c10::DeviceType, BackendType> deviceTypeToBackendType_;
+  std::unordered_map<c10::DeviceType, c10::intrusive_ptr<Backend>> deviceTypeToBackend_;
+  std::unordered_map<BackendType, c10::intrusive_ptr<Backend>> backendTypeToBackend_;
 };
 
 } // namespace c10d
