@@ -236,9 +236,13 @@ class TimmRunnner(BenchmarkRunner):
         #     (batch_size,) + input_size, device=device, dtype=data_dtype
         # )
         torch.manual_seed(1337)
+        print(input_size)
         input_tensor = torch.randint(
             256, size=(batch_size,) + input_size, device=device
         ).to(dtype=torch.float32)
+        print(input_tensor)
+        print(input_tensor.sum())
+        print("####")
         mean = torch.mean(input_tensor)
         std_dev = torch.std(input_tensor)
         example_inputs = (input_tensor - mean) / std_dev
