@@ -10,8 +10,10 @@
 #include <utility>
 
 #include <fmt/format.h>
+#include <nlohmann/json.hpp>
 
 #ifdef USE_KINETO
+#include <MetadataFieldCatalog.h>
 #include <libkineto.h>
 #endif
 
@@ -63,6 +65,77 @@ TensorMetadata::TensorMetadata(
       sizes_{std::move(sizes)},
       strides_{std::move(strides)} {
   SOFT_ASSERT(r.weak_self_.has_value());
+}
+
+OpArgData parseArgData(
+    const std::vector<op_input_t>& input_shapes,
+    const std::vector<op_input_t>& concreteInputs) {
+  if (input_shapes.empty()) {
+    return OpArgData{.hasData = false};
+  }
+
+  std::vector<shape> shapes(input_shapes.size());
+  std::vector<shape> strides(input_shapes.size());
+  std::vector<std::vector<int64_t>> shapesForKinetoEvent(input_shapes.size());
+
+  std::vector<std::string> dtypes(input_shapes.size());
+  std::vector<c10::IValue> concrete_inputs_list;
+
+  for (const auto& i : c10::irange(input_shapes.size())) {
+    std::visit(
+        c10::overloaded(
+            [&](const TensorMetadata& t) {
+              shapes[i] = t.sizes_;
+              shapesForKinetoEvent[i] = t.sizes_;
+              dtypes[i] = std::string(scalarTypeToTypeMeta(t.dtype_).name());
+              strides[i] = t.strides_;
+            },
+            [&](const std::vector<TensorMetadata>& l) {
+              std::vector<std::vector<int64_t>> shape;
+              shape.reserve(l.size());
+              std::vector<std::vector<int64_t>> stride;
+              stride.reserve(l.size());
+              for (const auto& t : l) {
+                shape.emplace_back(t.sizes_);
+                stride.emplace_back(t.strides_);
+              }
+              shapes[i] = shape;
+              strides[i] = stride;
+              dtypes[i] = "TensorList";
+            },
+            [&](const c10::IValue&) { dtypes[i] = "Scalar"; },
+            [&](const auto&) {}),
+        input_shapes[i]);
+  }
+
+  // If we recorded concrete inputs, then parse them
+  if (input_shapes.size() == concreteInputs.size() && !concreteInputs.empty()) {
+    concrete_inputs_list.resize(input_shapes.size());
+
+    for (const auto& i : c10::irange(input_shapes.size())) {
+      std::visit(
+          c10::overloaded(
+              [&](const c10::IValue& val) { concrete_inputs_list[i] = val; },
+              [&](const auto&) {}),
+          input_shapes[i]);
+      std::visit(
+          c10::overloaded(
+              [&](const c10::IValue& val) {
+                concrete_inputs_list[i] = val;
+                dtypes[i] = "ScalarList";
+              },
+              [&](const auto&) {}),
+          concreteInputs[i]);
+    }
+  }
+
+  return OpArgData{
+      .hasData = true,
+      .shapes = shapes,
+      .dtypes = dtypes,
+      .concreteInputs = concrete_inputs_list,
+      .shapesForKinetoEvent = shapesForKinetoEvent,
+      .strides = strides};
 }
 
 // ============================================================================
@@ -172,7 +245,7 @@ bool InputOutputEncoder::isSupportedScalarList(
   return true;
 }
 
-// This function returns a lambda which is is a custom-iterator-like getter.
+// This function returns a lambda which is a custom-iterator-like getter.
 // Each invocation of the lambda returns input values for one op.
 //
 // io_type is used to filter the ivalues between 'Shapes' and 'Concrete Args'.
@@ -343,12 +416,14 @@ std::unique_ptr<KinetoObserverContext> ThreadLocalSubqueue::begin_op(
     torch_ops_.inputs_outputs_.push(fn.inputs());
     torch_ops_.kwinputs_.emplace_back(fn.kwinputs());
   }
+  bool pushed_correlation_id = false;
   if (!config_.experimental_config.disable_external_correlation) {
     if (fn.scope() == at::RecordScope::USER_SCOPE) {
       torch::profiler::impl::kineto::pushUserCorrelationId(corr_id);
     } else {
       torch::profiler::impl::kineto::pushCorrelationId(corr_id);
     }
+    pushed_correlation_id = true;
   }
 
 #if !defined BUILD_LITE_INTERPRETER && !defined C10_MOBILE
@@ -369,6 +444,7 @@ std::unique_ptr<KinetoObserverContext> ThreadLocalSubqueue::begin_op(
   }
 
   auto out = std::make_unique<KinetoObserverContext>(event);
+  out->pushed_correlation_id_ = pushed_correlation_id;
   if (fn.isNcclMeta()) {
     // Record NCCL metadata for specific CPU ops, switch off output
     // introspection in this begin_op callback, we will do that in exit callback
@@ -396,7 +472,10 @@ std::unique_ptr<KinetoObserverContext> ThreadLocalSubqueue::begin_op(
   }
 
   event->start_time_ = c10::getApproximateTime();
-  event->allow_tf32_cublas_ = at::globalContext().allowTF32CuBLAS();
+  event->allow_tf32_cublas_ =
+      at::globalContext().float32Precision(
+          at::Float32Backend::CUDA, at::Float32Op::MATMUL) ==
+      at::Float32Precision::TF32;
   if (!config_.experimental_config.performance_events.empty()) {
     const size_t n = config_.experimental_config.performance_events.size();
     event->counters_ = std::make_unique<perf_counters_t>(n, 0);
@@ -453,7 +532,7 @@ void ThreadLocalSubqueue::TorchOpStorage::materialize(
     auto& second = (++it)->basic_fields_;
     if (first.scope_ == at::RecordScope::FUNCTION &&
         second.scope_ == at::RecordScope::BACKWARD_FUNCTION &&
-        first.name_.rfind("autograd::engine::evaluate_function: ", 0) == 0) {
+        first.name_.starts_with("autograd::engine::evaluate_function: ")) {
       first.sequence_number_ = second.sequence_number_;
       first.forward_tid_ = second.forward_tid_;
     }
@@ -475,14 +554,12 @@ void ThreadLocalSubqueue::TorchOpStorage::materialize(
   auto input_shape_getter = inputs_outputs_.getInputShapeGenerator();
   auto concrete_input_getter = inputs_outputs_.getConcreteInputGenerator();
 
-  // TODO: CTAD will take care of template args when we move to C++17
-  auto jit_stack = StealOrDefault<decltype(jit_stack_)>(jit_stack_);
-  auto jit_module = StealOrDefault<decltype(jit_modules_)>(jit_modules_);
-  auto extra_args = StealOrDefault<decltype(extra_args_)>(extra_args_);
-  auto extra_meta = StealOrDefault<decltype(extra_meta_)>(extra_meta_);
-  auto kwinputs = StealOrDefault<decltype(kwinputs_)>(kwinputs_);
-  auto gpu_fallback =
-      StealOrDefault<decltype(device_fallback_)>(device_fallback_);
+  auto jit_stack = StealOrDefault(jit_stack_);
+  auto jit_module = StealOrDefault(jit_modules_);
+  auto extra_args = StealOrDefault(extra_args_);
+  auto extra_meta = StealOrDefault(extra_meta_);
+  auto kwinputs = StealOrDefault(kwinputs_);
+  auto gpu_fallback = StealOrDefault(device_fallback_);
 
   for (auto event = op_events_.begin(); event != op_events_.end(); ++event) {
     ExtraFields<EventType::TorchOp> e{
@@ -612,6 +689,7 @@ std::string Result::name() const {
       ATTRIBUTE(OutOfMemory, std::string("[OutOfMemory]")),
       ATTRIBUTE(PyCall, toString(e)),
       ATTRIBUTE(PyCCall, std::string(e.function_name_.str())),
+      ATTRIBUTE(PythonGC, std::string("Python GC")),
       [](const auto& e) -> std::string { return e.name_; }));
 }
 
@@ -630,6 +708,7 @@ libkineto::ActivityType Result::kinetoType() const {
       ATTRIBUTE(OutOfMemory, libkineto::ActivityType::CPU_INSTANT_EVENT),
       ATTRIBUTE(PyCall, libkineto::ActivityType::PYTHON_FUNCTION),
       ATTRIBUTE(PyCCall, libkineto::ActivityType::PYTHON_FUNCTION),
+      ATTRIBUTE(PythonGC, libkineto::ActivityType::PYTHON_FUNCTION),
       ATTRIBUTE(Kineto, e.activity_type_)));
 }
 
@@ -649,6 +728,7 @@ int64_t Result::endTimeNS() const {
       ATTRIBUTE(Allocation, start_time_ns_),
       ATTRIBUTE(OutOfMemory, start_time_ns_),
       ATTRIBUTE(Kineto, start_time_ns_ + e.duration_ns_),
+      ATTRIBUTE(PythonGC, start_time_ns_ + e.duration_ns_),
       [&](const auto& e) -> int64_t { return e.end_time_ns_; }));
 
   // In rare cases we're willing to tolerate ops which are missing an end time
@@ -699,11 +779,18 @@ RecordQueue::RecordQueue(
       activities_{std::move(activities)} {
   if (tracePython()) {
     python_tracer_ = python_tracer::PythonTracerBase::make(this);
+    if (getPythonGcEvents()) {
+      python_tracer_->register_gc_callback();
+    }
   }
 }
 
 bool RecordQueue::tracePython() const {
   return config_.with_stack && activities_.count(ActivityType::CPU);
+}
+
+bool RecordQueue::getPythonGcEvents() const {
+  return config_.experimental_config.record_python_gc_info;
 }
 
 ThreadLocalSubqueue* RecordQueue::getSubqueue() {
@@ -755,7 +842,7 @@ void mark_finished(std::shared_ptr<Result>& r) {
 // Assumption: Total threads number will not exceed 2^16-1, and total ops will
 // not exceed 2^48 -1.
 static uint64_t getForwardThreadKey(uint64_t tid, uint64_t seqNr) {
-  return (((tid) << 48) | ((seqNr) & (((uint64_t)1 << 48) - 1)));
+  return ((tid << 48) | (seqNr & (((uint64_t)1 << 48) - 1)));
 }
 
 void generateForwardBackwardLink(
@@ -865,6 +952,12 @@ void generateForwardBackwardLinks(
 
 static constexpr const char* indexKey = "Ev Idx";
 
+static std::string sanitizeNameForKinetoJSON(std::string name) {
+  // Kineto's Chrome trace writer quotes names itself but does not escape '"'.
+  std::replace(name.begin(), name.end(), '"', '\'');
+  return name;
+}
+
 void passEventsToKineto(
     const std::vector<std::shared_ptr<Result>>& results,
     uint64_t start_time_ns,
@@ -886,6 +979,7 @@ void passEventsToKineto(
     if (!e->overload_name().empty()) {
       name = fmt::format("{}.{}", e->name(), e->overload_name());
     }
+    name = sanitizeNameForKinetoJSON(std::move(name));
     auto* activity = cpu_trace.addCPUActivity(
         name,
         e->kinetoType(),
@@ -896,15 +990,16 @@ void passEventsToKineto(
 
     TORCH_INTERNAL_ASSERT(activity || !kKinetoAvailable);
     if (activity) {
-      addMetadata(activity, indexKey, std::to_string(i));
+#ifdef USE_KINETO
+      activity->addMetadata(
+          libkineto::GenericMetadataFields::kEvIdx, static_cast<int64_t>(i));
+#endif
 
-      // There is a longstanding regression for initializing
-      // on-demand Kineto activity handling. Enabling this path
-      // for Profiler API could cause side effects as much has changed since.
-      // Make a surgical fix here until we holistically assess the on-demand
-      // vs API path framentation, which has been snowballing in complexity
-      // and thus flakiness.
-      if (config.global()) {
+      // In the normal (synchronous) path, kineto_activity_ is set later
+      // by TransferEvents::reassociate(). For global (async) profiling
+      // and trace_only mode the reassociation path diverges, so we also
+      // set it here while the raw pointer from addCPUActivity is valid.
+      if (config.global() || config.experimental_config.trace_only) {
         e->kineto_activity_ = activity;
       }
     }
@@ -950,8 +1045,9 @@ class TransferEvents {
  public:
   TransferEvents(
       std::vector<std::shared_ptr<Result>>& results,
-      trace_ptr_t& trace)
-      : results_{results} {
+      trace_ptr_t& trace,
+      const ProfilerConfig& config)
+      : results_{results}, config_{config} {
     auto* trace_activities_ptr = trace->get()->activities();
     TORCH_INTERNAL_ASSERT(trace_activities_ptr != nullptr);
     trace_activities_ = *trace_activities_ptr;
@@ -1015,6 +1111,12 @@ class TransferEvents {
     }
   }
 
+  bool isHiddenEvent(const itrace_t* activity) const {
+    TORCH_INTERNAL_ASSERT(activity != nullptr);
+    // Kineto uses "hidden" metadata to mark events that should be hidden.
+    return activity->getMetadataValue("hidden") == "1";
+  }
+
   std::shared_ptr<Result> resultFromActivity(const itrace_t* activity) {
     TORCH_INTERNAL_ASSERT(activity != nullptr);
 
@@ -1035,7 +1137,7 @@ class TransferEvents {
             {/*id=*/static_cast<uint32_t>(activity->flowId()),
              /*type=*/static_cast<uint32_t>(activity->flowType()),
              /*start=*/activity->flowStart()}});
-
+    event->hidden_ = isHiddenEvent(activity);
     // NB: It's tempting to set `event->kineto_activity_`; however we can only
     // guarantee that the events we passed to Kineto are of type
     // `GenericTraceActivity`. Others may derive from ITraceActivity and thus
@@ -1075,13 +1177,58 @@ class TransferEvents {
   void extractEventsFromTrace() {
     for (const auto* activity : trace_activities_) {
       auto e = toResult(activity);
-      const auto* linked_activity = activity->linkedActivity();
-      if (e && linked_activity) {
+      if (e) {
+        // Flow data for Kineto events is already set during
+        // resultFromActivity(). TorchOp events need it copied here because
+        // their Result is created during RecordFunction callbacks, before
+        // flow data exists on the GenericTraceActivity.
         e->visit(c10::overloaded(
-            [&](ExtraFields<EventType::Kineto>& i) {
-              i.linked_activity_ = toResult(linked_activity);
+            [&](ExtraFields<EventType::TorchOp>& i) {
+              i.flow = {
+                  /*id=*/static_cast<uint32_t>(activity->flowId()),
+                  /*type=*/static_cast<uint32_t>(activity->flowType()),
+                  /*start=*/activity->flowStart()};
             },
-            [](auto&) { TORCH_INTERNAL_ASSERT(false); }));
+            [](auto&) {}));
+        if (config_.get().experimental_config.expose_kineto_event_metadata) {
+          e->visit(c10::overloaded(
+              [&](ExtraFields<EventType::TorchOp>& i) {
+                i.metadata_json_ = activity->metadataJson();
+              },
+              [&](ExtraFields<EventType::Kineto>& i) {
+                i.metadata_json_ = activity->metadataJson();
+              },
+              [](auto&) { return; }));
+          // Parse metadataJson() into extra_meta_ so events() exposes
+          // Kineto metadata as typed fields without export_chrome_trace().
+          // Python schemas (profiler_util.py) are the single SOT for
+          // which keys to expose and how to type-convert them.
+          e->visit(c10::overloaded(
+              [&](ExtraFields<EventType::Kineto>& i) {
+                auto json_str = activity->metadataJson();
+                if (!json_str.empty()) {
+                  auto j = nlohmann::json::parse(
+                      "{" + json_str + "}", nullptr, false);
+                  if (!j.is_discarded()) {
+                    for (auto& [key, val] : j.items()) {
+                      i.extra_meta_.emplace(
+                          key,
+                          val.is_string() ? val.get<std::string>()
+                                          : val.dump());
+                    }
+                  }
+                }
+              },
+              [](auto&) {}));
+        }
+        const auto* linked_activity = activity->linkedActivity();
+        if (linked_activity) {
+          e->visit(c10::overloaded(
+              [&](ExtraFields<EventType::Kineto>& i) {
+                i.linked_activity_ = toResult(linked_activity);
+              },
+              [](auto&) { TORCH_INTERNAL_ASSERT(false); }));
+        }
       }
     }
   }
@@ -1105,20 +1252,30 @@ class TransferEvents {
   void setParents() {
     // First pass: Collect start events and set parent to linked event.
     ska::flat_hash_map<uint32_t, std::shared_ptr<Result>> flow_map;
+    uint64_t dropped_flow_count = 0;
     for (auto& e : results_.get()) {
       TORCH_INTERNAL_ASSERT(e != nullptr);
       e->visit(c10::overloaded(
           [&](const ExtraFields<EventType::Kineto>& i) {
             if (i.flow.type == libkineto::kLinkAsyncCpuGpu && i.flow.start) {
               auto inserted = flow_map.insert({i.flow.id, e});
-#ifdef USE_ROCM
-              if (inserted.second) {
+              if (!inserted.second) {
+                // Two flow start events arrived with the same ID, so the
+                // active backend produced a non-unique correlation ID.
+                // Nothing in the colliding pair tells us which start (if
+                // either) is the true owner of this ID, so attaching the
+                // matching flow end to the first inserter would risk
+                // linking it to an unrelated CPU op. Poison the slot so
+                // the colliding flow end skips the flow lookup and falls
+                // back to its linked_activity_ parent set in the first
+                // pass: an approximate runtime-correlation link, but never
+                // a wrong one. Any legitimate flow-based link for either
+                // start is forfeited as a result.
                 TORCH_WARN_ONCE(
-                    "ROCTracer produced duplicate flow start: ", i.flow.id);
+                    "Profiler produced duplicate flow start: ", i.flow.id);
+                ++dropped_flow_count;
+                inserted.first->second.reset();
               }
-#else // USE_ROCM
-              TORCH_INTERNAL_ASSERT(inserted.second);
-#endif // USE_ROCM
             }
             TORCH_INTERNAL_ASSERT(e->parent_.expired());
             e->parent_ = i.linked_activity_;
@@ -1130,9 +1287,10 @@ class TransferEvents {
     for (auto& e : results_.get()) {
       e->visit(c10::overloaded(
           [&](const ExtraFields<EventType::Kineto>& i) {
-            // Flow takes priority over linked event.
+            // Flow takes priority over linked event. Skip poisoned slots
+            // (set to null when a duplicate flow start ID was detected).
             const auto it = flow_map.find(i.flow.id);
-            if (it != flow_map.end() &&
+            if (it != flow_map.end() && it->second &&
                 i.flow.type == libkineto::kLinkAsyncCpuGpu && !i.flow.start) {
               e->parent_ = it->second;
             }
@@ -1147,6 +1305,15 @@ class TransferEvents {
           [](const auto&) {}));
     }
 
+    if (dropped_flow_count > 0) {
+      TORCH_WARN(
+          "Profiler observed ",
+          dropped_flow_count,
+          " duplicate flow start ID(s); affected events were linked via "
+          "runtime correlation instead. This indicates a flow ID collision "
+          "in the active backend's profiler.");
+    }
+
     // Set TIDs now that we have established lineage.
     for (auto& e : results_.get()) {
       if (e->parent_.expired()) {
@@ -1158,6 +1325,7 @@ class TransferEvents {
   static constexpr long long unmatchedIndex = -1;
   static constexpr auto noTID = std::numeric_limits<uint64_t>::max();
   std::reference_wrapper<std::vector<std::shared_ptr<Result>>> results_;
+  std::reference_wrapper<const ProfilerConfig> config_;
   std::vector<const itrace_t*> trace_activities_;
   ska::flat_hash_map<const itrace_t*, std::shared_ptr<Result>> kineto_events_;
 };
@@ -1165,7 +1333,7 @@ class TransferEvents {
 class TransferEvents {
  public:
   template <class... Args>
-  TransferEvents(Args&&...) {}
+  TransferEvents(Args&&... /*unused*/) {}
 };
 #endif
 
@@ -1184,7 +1352,9 @@ trace_ptr_t addKinetoEvents(
 
   auto trace = std::make_unique<ActivityTraceWrapper>(stopTrace());
   TORCH_INTERNAL_ASSERT(trace || !kKinetoAvailable);
-  TransferEvents transfer{results, trace};
+  if (!config.experimental_config.trace_only) {
+    TransferEvents transfer{results, trace, config};
+  }
   return trace;
 }
 
@@ -1280,7 +1450,7 @@ void build_tree(std::vector<std::shared_ptr<Result>>& sorted_events) {
     stacks.erase(start_tid);
     auto new_frame = event->parent_.lock();
     if (new_frame != nullptr) {
-      stacks[start_tid] = new_frame;
+      stacks[start_tid] = std::move(new_frame);
     }
   };
 
@@ -1481,6 +1651,31 @@ RecordQueue::getRecords(
     queue.allocations_.clear();
     materialize(queue.ooms_);
 
+    std::optional<int64_t> pending_start;
+    for (auto& e : queue.pythongc_) {
+      if (e.first.find("start") != std::string::npos) {
+        pending_start = e.second;
+      } else if (e.first.find("stop") != std::string::npos) {
+        if (pending_start.has_value()) {
+          out.emplace_back(Result::create(
+              /*start_time_ns_=*/converter(pending_start.value()),
+              /*start_tid_=*/queue.tid(),
+              /*kineto_info_=*/queue.kineto_info(),
+              /*extra_fields_=*/
+              // NOLINTNEXTLINE
+              ExtraFields<EventType::PythonGC>{
+                  e.first,
+                  converter(e.second) - converter(pending_start.value())}));
+          pending_start.reset();
+        } else {
+          // Handle the case where "stop" is found without a matching "start"
+          // For example, you might want to log a warning or take other action:
+          LOG(WARNING) << R"("stop" event found without a matching "start": )"
+                       << e.first;
+        }
+      }
+    }
+
     for (auto& i : queue.py_calls_) {
       python_enters.push_back(
           {i.first, queue.tid(), queue.kineto_info(), converter(i.second)});
@@ -1556,7 +1751,7 @@ RecordQueue::getRecords(
   }
 
   build_tree(out);
-  return {out, std::move(trace)};
+  return {std::move(out), std::move(trace)};
 }
 
 namespace {

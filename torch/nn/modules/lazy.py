@@ -1,6 +1,6 @@
 # mypy: allow-untyped-defs
 import itertools
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
 
 import torch
 from torch.nn.parameter import is_lazy
@@ -53,7 +53,7 @@ class _LazyProtocol(Protocol):
 class LazyModuleMixin:
     r"""A mixin for modules that lazily initialize parameters, also known as "lazy modules".
 
-    .. warning:
+    .. warning::
         Lazy modules are an experimental new feature under active development,
         and their API is likely to change.
 
@@ -167,12 +167,14 @@ class LazyModuleMixin:
 
     # modules inheriting from this will change their __class__ to the specified
     # one after they are fully initialized
-    cls_to_become: Optional[type[Any]] = None
+    cls_to_become: type[Any] | None = None
 
     def __init__(self: _LazyProtocol, *args, **kwargs):
-        # Mypy doesnt like this super call in a mixin
+        # Mypy doesn't like this super call in a mixin
         super().__init__(*args, **kwargs)  # type: ignore[misc]
+        # pyrefly: ignore [read-only]
         self._load_hook = self._register_load_state_dict_pre_hook(self._lazy_load_hook)
+        # pyrefly: ignore [read-only]
         self._initialize_hook = self.register_forward_pre_hook(
             self._infer_parameters, with_kwargs=True
         )
@@ -218,7 +220,7 @@ class LazyModuleMixin:
             if key in state_dict and param is not None:
                 input_param = state_dict[key]
                 if is_lazy(param):
-                    # The current parameter is not initialized but the one being loaded one is
+                    # The current parameter is not initialized but the one being loaded is
                     # create a new parameter based on the uninitialized one
                     if not is_lazy(input_param):
                         with torch.no_grad():
@@ -250,7 +252,7 @@ class LazyModuleMixin:
     def _infer_parameters(self: _LazyProtocol, module, args, kwargs=None):
         r"""Infers the size and initializes the parameters according to the provided input batch.
 
-        Given a module that contains parameters that were declared inferrable
+        Given a module that contains parameters that were declared inferable
         using :class:`torch.nn.parameter.ParameterMode.Infer`, runs a forward pass
         in the complete module using the provided input to initialize all the parameters
         as needed.

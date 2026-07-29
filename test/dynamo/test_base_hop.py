@@ -1,5 +1,4 @@
 # Owner(s): ["module: dynamo"]
-import unittest
 import unittest.mock as mock
 
 import torch
@@ -13,10 +12,6 @@ from torch._dynamo.testing import (
 )
 from torch._higher_order_ops.schema import find_hop_schema
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
-from torch.testing._internal.inductor_utils import HAS_CUDA
-
-
-requires_cuda = unittest.skipUnless(HAS_CUDA, "requires cuda")
 
 
 def normalize_graph(gm):
@@ -53,7 +48,8 @@ class BaseHOPTest(torch._dynamo.test_case.TestCase):
         out = f(x, y)
         self.assertEqual(out, inner(x, y))
 
-        assert len(backend.graphs) == 1
+        if len(backend.graphs) != 1:
+            raise AssertionError(f"Expected 1 graph, got {len(backend.graphs)}")
         self.assertExpectedInline(
             normalize_graph(backend.graphs[0]),
             """\
@@ -73,7 +69,7 @@ class GraphModule(torch.nn.Module):
             sin: "f32[3, 3]" = matmul.sin();  matmul = None
             cos: "f32[3, 3]" = sin.cos();  sin = None
             return (cos,)
-""",  # NOQA: B950
+""",
         )
 
     def test_schema_gen_single_return(self):
@@ -95,7 +91,7 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(len(schemas), 1)
         self.assertExpectedInline(
             str(schemas[0]),
-            """invoke_quant_test(Any subgraph, Tensor arg0, Tensor arg1, *, str scheme="nf4") -> ((Tensor))""",  # noqa: B950
+            """invoke_quant_test(Any subgraph, Tensor arg0, Tensor arg1, *, str scheme="nf4") -> ((Tensor))""",
         )
 
     def test_schema_gen_pytree_in_out(self):
@@ -123,7 +119,7 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(len(schemas), 1)
         self.assertExpectedInline(
             str(schemas[0]),
-            """invoke_quant_test(Any subgraph, Tensor arg0, Tensor arg1, *, str scheme="nf4") -> (Tensor, Tensor, Tensor, Tensor)""",  # noqa: B950
+            """invoke_quant_test(Any subgraph, Tensor arg0, Tensor arg1, *, str scheme="nf4") -> (Tensor, Tensor, Tensor, Tensor)""",
         )
 
     def test_schema_gen_single_return_with_mutation(self):
@@ -169,7 +165,7 @@ class GraphModule(torch.nn.Module):
             sin: "f32[3, 3]" = matmul.sin();  matmul = None
             cos: "f32[3, 3]" = sin.cos();  sin = None
             return (cos,)
-""",  # noqa: B950
+""",
         )
         self.assertExpectedInline(
             str(find_hop_schema(backend.graphs[0], invoke_quant_test)[0]),
@@ -195,10 +191,13 @@ class GraphModule(torch.nn.Module):
         def f(x, y):
             return invoke_quant_test(inner, [x, y], scheme="nf4")
 
-        with mock.patch(
-            "torch._dynamo.variables.higher_order_ops.BaseHOPVariable.supports_input_mutation",
-            True,
-        ), torch.no_grad():
+        with (
+            mock.patch(
+                "torch._dynamo.variables.higher_order_ops.BaseHOPVariable.supports_input_mutation",
+                True,
+            ),
+            torch.no_grad(),
+        ):
             torch.compile(f, backend=bk, fullgraph=True)(x.clone(), y)
 
         self.assertEqual(len(bk.graphs), 1)
@@ -224,18 +223,18 @@ class GraphModule(torch.nn.Module):
 
             matmul: "f32[3, 3]" = l_x_ @ l_y_
             sin: "f32[3, 3]" = matmul.sin();  matmul = None
-            child: "f32[3, 3]" = sin.cos();  sin = None
+            cos: "f32[3, 3]" = sin.cos();  sin = None
 
-            child_1: "f32[3, 3]" = l_x_ + l_y_
-            child_2: "f32[3, 3]" = l_x_ - l_y_
+            add: "f32[3, 3]" = l_x_ + l_y_
+            sub: "f32[3, 3]" = l_x_ - l_y_
 
-            child_3: "f32[3, 3]" = l_x_ @ l_y_;  l_x_ = l_y_ = None
-            return (child, child_1, child_2, child_3)
-""",  # noqa: B950
+            matmul_1: "f32[3, 3]" = l_x_ @ l_y_;  l_x_ = l_y_ = None
+            return (cos, add, sub, matmul_1)
+""",
         )
         self.assertExpectedInline(
             str(find_hop_schema(bk.graphs[0], invoke_quant_test)[0]),
-            """invoke_quant_test(Any subgraph, Tensor(a1!) arg0, Tensor arg1, *, str scheme="nf4") -> (Tensor, Tensor, Tensor, Tensor)""",  # noqa: B950
+            """invoke_quant_test(Any subgraph, Tensor(a1!) arg0, Tensor arg1, *, str scheme="nf4") -> (Tensor, Tensor, Tensor, Tensor)""",
         )
 
     def test_none_input(self):
@@ -319,10 +318,13 @@ class GraphModule(torch.nn.Module):
         x = torch.randn(3, 3, requires_grad=False)
         x_clone = x.clone()
         y = torch.randn(3, 3, requires_grad=True)
-        with mock.patch(
-            "torch._dynamo.variables.higher_order_ops.BaseHOPVariable.supports_input_mutation",
-            True,
-        ), torch.no_grad():
+        with (
+            mock.patch(
+                "torch._dynamo.variables.higher_order_ops.BaseHOPVariable.supports_input_mutation",
+                True,
+            ),
+            torch.no_grad(),
+        ):
             compiled_out = torch.compile(f, backend=backend, fullgraph=True)(x, y)
         self.assertEqual(x, x_clone + 1)
         self.assertEqual(compiled_out, x_clone + y + 1)
@@ -346,7 +348,7 @@ class <lambda>(torch.nn.Module):
             add_1: "f32[3, 3]" = torch.ops.aten.add.Tensor(add, arg1_1);  arg1_1 = None
             copy_: "f32[3, 3]" = torch.ops.aten.copy_.default(arg0_1, add);  arg0_1 = add = copy_ = None
             return (add_1,)
-""",  # noqa: B950
+""",
         )
 
     @torch._dynamo.config.patch(assume_static_by_default=True)
@@ -369,7 +371,8 @@ class <lambda>(torch.nn.Module):
         expected = torch.autograd.grad(out, x, y)
         self.assertEqual(result, expected)
 
-        assert len(backend.fw_graphs) == 1
+        if len(backend.fw_graphs) != 1:
+            raise AssertionError(f"Expected 1 fw_graph, got {len(backend.fw_graphs)}")
         self.assertExpectedInline(
             normalize_graph(backend.fw_graphs[0]),
             """\
@@ -386,10 +389,11 @@ class GraphModule(torch.nn.Module):
             sin: "f32[3, 3]" = torch.ops.aten.sin.default(mm);  mm = None
             cos: "f32[3, 3]" = torch.ops.aten.cos.default(sin);  sin = None
             return (cos,)
-""",  # NOQA: B950
+""",
         )
 
-        assert len(backend.bw_graphs) == 1
+        if len(backend.bw_graphs) != 1:
+            raise AssertionError(f"Expected 1 bw_graph, got {len(backend.bw_graphs)}")
         self.assertExpectedInline(
             normalize_graph(backend.bw_graphs[0]),
             """\
@@ -416,7 +420,7 @@ class GraphModule(torch.nn.Module):
             t_1: "f32[3, 3]" = torch.ops.aten.t.default(arg1_1);  arg1_1 = None
             mm_2: "f32[3, 3]" = torch.ops.aten.mm.default(mul_1, t_1);  mul_1 = t_1 = None
             return (mm_2, mm_1)
-""",  # NOQA: B950
+""",
         )
 
     def test_aliasing_mutation_error(self):

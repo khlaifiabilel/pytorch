@@ -34,7 +34,7 @@ class XNNPackBackend : public PyTorchBackendInterface {
       c10::impl::GenericDict method_compile_spec) override {
     auto dict = processed.toGenericDict();
 
-    // Compiling and wrapping exeuction object
+    // Compiling and wrapping execution object
     const std::string& ser_model = dict.at("ser_model").toStringRef();
     XNNExecutor executor;
     XNNCompiler::compileModel(ser_model.data(), ser_model.length(), &executor);
@@ -59,7 +59,7 @@ class XNNPackBackend : public PyTorchBackendInterface {
     return handles;
   }
 
-  // Currently this is not implemented, and everything is computed a head of
+  // Currently this is not implemented, and everything is computed ahead of
   // time the current implementation just takes the computed results from ahead
   // of time and grabs them. The inputs are fed in through the compile spec for
   // the sake of testing. In reality, the inputs will be fed in at this stage

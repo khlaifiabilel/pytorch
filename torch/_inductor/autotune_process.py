@@ -2,25 +2,29 @@
 from __future__ import annotations
 
 import atexit
+import contextvars
 import ctypes
 import dataclasses
 import functools
 import logging
+import multiprocessing as mp
 import os
 import pickle
 import queue
 import selectors
 import subprocess
 import sys
+import threading
 import time
 import warnings
-from collections.abc import Iterable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from ctypes import byref, c_size_t, c_void_p, CDLL
-from typing import Any, Callable, IO, Optional, TYPE_CHECKING, Union
+from typing import Any, IO, TYPE_CHECKING
+from typing_extensions import override
 
 import torch
-import torch._inductor.async_compile  # noqa: F401 required to warm up AsyncCompile pools
+import torch._inductor.async_compile
 from torch._dynamo.device_interface import get_interface_for_device
 from torch._dynamo.testing import rand_strided
 from torch._inductor import ir
@@ -30,16 +34,38 @@ from torch._inductor.codecache import (
     DLLWrapper,
     get_hash,
     PyCodeCache,
+    write,
+    XPUCodeCache,
 )
-from torch._inductor.utils import get_gpu_type, get_ld_library_path, is_gpu
+from torch._inductor.compile_worker.timer import Timer
+from torch._inductor.utils import (
+    apply_subprocess_env,
+    clear_caches,
+    clear_on_fresh_cache,
+    do_bench_using_profiling,
+    get_gpu_type,
+    get_ld_library_path,
+    is_gpu,
+    python_subprocess_env,
+)
 from torch._logging import getArtifactLogger
 from torch.utils._ordered_set import OrderedSet
 
 
+# Inactivity timeout for AutotuneProcessPool in seconds.
+# Default: 600 seconds (10 minutes). Set to 0 to disable.
+AUTOTUNE_POOL_INACTIVITY_TIMEOUT = int(
+    os.environ.get("TORCHINDUCTOR_AUTOTUNE_POOL_INACTIVITY_TIMEOUT", "600")
+)
+
 if TYPE_CHECKING:
     from types import ModuleType
 
-    from torch._inductor.select_algorithm import TritonTemplateCaller
+    from torch._inductor.select_algorithm import (
+        ChoiceCaller,
+        PartialRender,
+        TritonTemplateCaller,
+    )
 
 from . import config
 from .runtime.benchmarking import benchmarker
@@ -48,11 +74,58 @@ from .virtualized import V
 
 CUDA_VISIBLE_DEVICES = "CUDA_VISIBLE_DEVICES"
 
+
+_visible_device_env_var_maps = {
+    "cuda": "CUDA_VISIBLE_DEVICES",
+    "xpu": "ZE_AFFINITY_MASK",
+}
+
+
+def get_visible_devices_env_var(gpu_type: str | None = None) -> str:
+    if gpu_type is None:
+        gpu_type = get_gpu_type()
+    if gpu_type not in _visible_device_env_var_maps:
+        raise ValueError(f"Unsupported gpu_type: {gpu_type}")
+    return _visible_device_env_var_maps[gpu_type]
+
+
 autotuning_log = getArtifactLogger(__name__, "autotuning")
 
 
 class NonzeroWorkspaceNotSupportedError(Exception):
     pass
+
+
+def _cache_env_for_subprocess() -> dict[str, str | None]:
+    env_vars = ["TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"]
+    return {v: os.environ.get(v) for v in env_vars}
+
+
+_last_applied_cache_env: dict[str, str | None] | None = None
+
+
+def _apply_subprocess_env_and_clear_caches(
+    extra_env: dict[str, str | None] | None,
+) -> None:
+    global _last_applied_cache_env
+
+    if extra_env is None:
+        return
+
+    if extra_env != _last_applied_cache_env:
+        clear_caches()
+        _last_applied_cache_env = extra_env.copy()
+    apply_subprocess_env(extra_env)
+
+
+def _run_with_subprocess_env(
+    fn: Callable[..., Any],
+    extra_env: dict[str, str | None],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    _apply_subprocess_env_and_clear_caches(extra_env)
+    return fn(*args, **kwargs)
 
 
 class TuningProcess:
@@ -68,16 +141,17 @@ class TuningProcess:
         autotuning_log.debug(
             "Started autotune subprocess %s. Visible devices: %s",
             os.getpid(),
-            os.environ.get(CUDA_VISIBLE_DEVICES),
+            os.environ.get(get_visible_devices_env_var()),
         )
 
         def workloop():
             while True:
-                job = TuningProcess.recv(read_pipe)
+                job, extra_env = TuningProcess.recv(read_pipe)
                 if job is None:
                     # None is a sentinel for the child to shut down
                     break
                 try:
+                    _apply_subprocess_env_and_clear_caches(extra_env)
                     result = job()
                 except Exception as e:
                     result = e
@@ -90,15 +164,17 @@ class TuningProcess:
             pass
 
     @staticmethod
-    def send(obj: Any, write_pipe: IO[bytes]) -> None:
-        pickle.dump(obj, write_pipe)
+    def send(
+        obj: Any, write_pipe: IO[bytes], extra_env: dict[str, str | None] | None = None
+    ) -> None:
+        pickle.dump((obj, extra_env), write_pipe)
         write_pipe.flush()
 
     @staticmethod
     def recv(read_pipe: IO[bytes]) -> Any:
         return pickle.load(read_pipe)
 
-    def __init__(self, device: Optional[int]):
+    def __init__(self, device: int | None):
         self.device = device
         self.start()
 
@@ -123,11 +199,8 @@ class TuningProcess:
             f"--read-fd={str(subproc_read_fd)}",
             f"--write-fd={str(subproc_write_fd)}",
         ]
-        extra_env = {
-            # We need to set the PYTHONPATH so the subprocess can find torch.
-            "PYTHONPATH": os.environ.get(
-                "TORCH_CUSTOM_PYTHONPATH", os.pathsep.join(sys.path)
-            ),
+        env = {
+            **python_subprocess_env(),
             # We shouldn't be using the Triton async compile subprocess pool,
             # but as a precaution set the env var that disables its creation.
             "TORCH_WARM_POOL": "0",
@@ -139,10 +212,10 @@ class TuningProcess:
             else "0",
         }
         if self.device is not None:
-            extra_env[CUDA_VISIBLE_DEVICES] = str(self.device)
+            env[get_visible_devices_env_var()] = str(self.device)
         self.process = subprocess.Popen(
             cmd,
-            env={**os.environ, **extra_env},
+            env=env,
             pass_fds=(subproc_read_fd, subproc_write_fd),
         )
         os.close(subproc_read_fd)
@@ -156,13 +229,13 @@ class TuningProcess:
         """
         return self.running and self.process.poll() is None
 
-    def put(self, req: Any) -> None:
+    def put(self, req: Any, extra_env: dict[str, str | None] | None = None) -> None:
         """
         Push a work item to the child process.
         """
         if not self.alive():
             self.start()
-        TuningProcess.send(req, self.write_pipe)
+        TuningProcess.send(req, self.write_pipe, extra_env=extra_env)
 
     def get(self, timeout: float = 120.0) -> Any:
         """
@@ -172,7 +245,7 @@ class TuningProcess:
         try:
             if not self.selector.select(timeout):
                 raise TimeoutError(f"Timeout in autotune subprocess {self.process.pid}")
-            result = TuningProcess.recv(self.read_pipe)
+            result, _ = TuningProcess.recv(self.read_pipe)
         except TimeoutError:
             self.kill()
             raise
@@ -229,6 +302,13 @@ class TuningProcess:
             self.process.kill()
         self.close()
 
+    def restart(self) -> None:
+        """
+        Gracefully restarts the child process.
+        """
+        self.shutdown(wait=True)
+        self.start()
+
 
 class TuningProcessPool:
     """
@@ -257,7 +337,7 @@ class TuningProcessPool:
         self.executor = ThreadPoolExecutor(max_workers=len(devices))
 
     @staticmethod
-    def get_device_list() -> Sequence[Optional[int]]:
+    def get_device_list() -> Sequence[int | None]:
         """
         Gather the list of devices to be used in the pool.
         """
@@ -268,11 +348,16 @@ class TuningProcessPool:
         gpu_type = get_gpu_type()
         device_interface = get_interface_for_device(gpu_type)
         count = device_interface.device_count()
+        visible_devices_env_var = get_visible_devices_env_var(gpu_type)
 
         # If the user specified the visible devices in the env, use those.
-        if CUDA_VISIBLE_DEVICES in os.environ:
-            devices = [int(d) for d in os.environ[CUDA_VISIBLE_DEVICES].split(",")]
-            assert len(devices) <= count
+        if visible_devices_env_var in os.environ:
+            devices = [int(d) for d in os.environ[visible_devices_env_var].split(",")]
+            if not len(devices) <= count:
+                raise AssertionError(
+                    f"{visible_devices_env_var} specifies {len(devices)} devices, "
+                    f"but only {count} devices are available"
+                )
             return devices
 
         return list(range(count))
@@ -294,10 +379,14 @@ class TuningProcessPool:
         remove it from the queue, execute the benchmark in that subprocess, and return
         the TuningProcess to the queue.
         """
-        assert choice.bmreq is not None
+        if choice.bmreq is None:
+            raise AssertionError(
+                f"Expected choice.bmreq to be set, but got None for choice '{choice}'"
+            )
 
+        extra_env = _cache_env_for_subprocess()
         process = self.process_queue.get()
-        process.put(choice.bmreq.benchmark)
+        process.put(choice.bmreq.benchmark, extra_env=extra_env)
         try:
             return process.get(
                 config.max_autotune_subproc_result_timeout_seconds,
@@ -309,11 +398,19 @@ class TuningProcessPool:
             )
             # Set to INF so this choice will be ignored
             return float("inf")
-        except Exception:
+        except Exception as process_exception:
             warnings.warn(
                 f"Failed to benchmark choice '{choice}'. It will be ignored. "
                 "Please debug the root cause in case the choice can bring perf gains."
             )
+            # Sticky CUDA errors corrupt the context, making it unrecoverable.
+            # The process must be restarted to restore CUDA functionality.
+            error_msg = str(process_exception)
+            if (
+                "cudaErrorLaunchFailure" in error_msg
+                or "cudaErrorIllegalAddress" in error_msg
+            ):
+                process.restart()
             # Set to INF so this choice will be ignored
             return float("inf")
         finally:
@@ -334,7 +431,7 @@ class TuningProcessPool:
         return results
 
 
-LayoutOrBuffer = Union[ir.Layout, ir.Buffer]
+LayoutOrBuffer = ir.Layout | ir.Buffer
 
 
 @dataclasses.dataclass
@@ -344,15 +441,21 @@ class TensorMeta:
     sizes: torch._prims_common.ShapeType
     strides: torch._prims_common.StrideType
     offset: int
-    name: Optional[str] = None
+    name: str | None = None
 
     @classmethod
     def from_irnodes(
-        cls, irnodes: Union[LayoutOrBuffer, Sequence[LayoutOrBuffer]]
-    ) -> Union[TensorMeta, list[TensorMeta]]:
+        cls, irnodes: LayoutOrBuffer | Sequence[LayoutOrBuffer]
+    ) -> TensorMeta | list[TensorMeta]:
+        from torch._inductor.select_algorithm import get_strides_with_layout_constraints
+
         if isinstance(irnodes, Sequence):
             result: list[Any] = [cls.from_irnodes(x) for x in irnodes]
-            assert all(isinstance(x, TensorMeta) for x in result)
+            if not all(isinstance(x, TensorMeta) for x in result):
+                raise AssertionError(
+                    f"Expected all elements to be TensorMeta, got types: "
+                    f"{[type(x) for x in result if not isinstance(x, TensorMeta)]}"
+                )
             return result
 
         node = irnodes
@@ -360,25 +463,24 @@ class TensorMeta:
             node = ir.Buffer(name="fake", layout=node)
 
         dtype = node.get_dtype()
-        assert dtype is not None
+        if dtype is None:
+            raise AssertionError(
+                f"Expected node to have a dtype, but get_dtype() returned None for node '{node}'"
+            )
         device = node.get_device()
-        assert device is not None
+        if device is None:
+            raise AssertionError(
+                f"Expected node to have a device, but get_device() returned None for node '{node}'"
+            )
 
         return TensorMeta(
             device=device,
             dtype=dtype,
-            sizes=V.graph.sizevars.size_hints(
-                node.get_size(),
-                fallback=config.unbacked_symint_fallback,
+            sizes=V.graph.sizevars.optimization_hints(node.get_size()),
+            strides=V.graph.sizevars.optimization_hints(
+                get_strides_with_layout_constraints(node)
             ),
-            strides=V.graph.sizevars.size_hints(
-                node.get_stride(),
-                fallback=config.unbacked_symint_fallback,
-            ),
-            offset=V.graph.sizevars.size_hint(
-                node.get_layout().offset,
-                fallback=config.unbacked_symint_fallback,
-            ),
+            offset=V.graph.sizevars.optimization_hint(node.get_layout().offset),
             name=node.get_name(),
         )
 
@@ -405,29 +507,37 @@ class BenchmarkRequest:
     def __init__(
         self,
         kernel_name: str,
-        input_tensor_meta: Union[TensorMeta, list[TensorMeta]],
-        output_tensor_meta: Union[TensorMeta, list[TensorMeta]],
+        input_tensor_meta: TensorMeta | list[TensorMeta],
+        output_tensor_meta: TensorMeta | list[TensorMeta],
         extra_args: Iterable[Any],
     ) -> None:
         # the kernel name defined in the module
         self.kernel_name = kernel_name
 
         if isinstance(input_tensor_meta, TensorMeta):
-            input_tensor_meta = [input_tensor_meta]
-        self.input_tensor_meta = input_tensor_meta
+            self.input_tensor_meta: list[TensorMeta] = [input_tensor_meta]
+        else:
+            self.input_tensor_meta: list[TensorMeta] = input_tensor_meta
 
-        if isinstance(output_tensor_meta, (tuple, list)):
+        if output_tensor_meta and isinstance(output_tensor_meta, (tuple, list)):
             if len(output_tensor_meta) > 1:
                 # Each output with same meta for Grouped GEMM
-                assert all(
+                if not all(
                     getattr(output_tensor_meta[0], attr) == getattr(x, attr)
                     for x in output_tensor_meta
                     for attr in ["device", "dtype", "sizes", "strides", "offset"]
-                )
-            output_tensor_meta = output_tensor_meta[0]
-        self.output_tensor_meta = output_tensor_meta
+                ):
+                    raise AssertionError(
+                        "All output tensor metas in a Grouped GEMM must have matching "
+                        "device, dtype, sizes, strides, and offset"
+                    )
+            self.output_tensor_meta = output_tensor_meta[0]
+        else:
+            # pyrefly: ignore [bad-assignment]
+            self.output_tensor_meta: TensorMeta = output_tensor_meta
 
         self.extra_args = extra_args
+        self.benchmark_with_cudagraphs = False
 
     def make_run_fn(
         self, *input_tensors: torch.Tensor, out: torch.Tensor
@@ -441,14 +551,14 @@ class BenchmarkRequest:
         self,
         fn,
         *input_tensors: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
     ) -> float:
         raise NotImplementedError
 
     def benchmark(
         self,
         *input_tensors: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
     ) -> float:
         debug = autotuning_log.isEnabledFor(logging.DEBUG)
         if debug:
@@ -456,7 +566,14 @@ class BenchmarkRequest:
 
         # create args and out tensor
         if out is None:
-            assert len(input_tensors) == 0
+            if not (self.input_tensor_meta and self.output_tensor_meta):
+                raise AssertionError(
+                    "Input and output tensor meta must be populated when input_tensors is empty"
+                )
+            if not len(input_tensors) == 0:
+                raise AssertionError(
+                    f"Expected no input_tensors when out is None, but got {len(input_tensors)}"
+                )
             input_tensors = tuple(x.to_tensor() for x in self.input_tensor_meta)
             out = self.output_tensor_meta.to_tensor()
 
@@ -464,29 +581,34 @@ class BenchmarkRequest:
             create_tensor_elapse = time.time() - start_ts  # type: ignore[possibly-undefined]
             start_ts = time.time()
         try:
-            fn = self.make_run_fn(*input_tensors, out=out)
-        except NonzeroWorkspaceNotSupportedError:
-            # Skipping all ops with nonzero workspace requirements
-            autotuning_log.info("Skipping op due to nonzero workspace requirement")
-            return float("inf")
+            try:
+                fn = self.make_run_fn(*input_tensors, out=out)
+            except NonzeroWorkspaceNotSupportedError:
+                # Skipping all ops with nonzero workspace requirements
+                autotuning_log.info("Skipping op due to nonzero workspace requirement")
+                return float("inf")
 
-        if debug:
-            load_elapse = time.time() - start_ts  # type: ignore[possibly-undefined]
-            start_ts = time.time()
+            if debug:
+                load_elapse = time.time() - start_ts  # type: ignore[possibly-undefined]
+                start_ts = time.time()
 
-        res = self.do_bench(fn, *input_tensors, out)
+            if self.benchmark_with_cudagraphs:
+                res = benchmarker.benchmark_gpu_with_cuda_graph(fn)
+            else:
+                res = self.do_bench(fn, *input_tensors, out)
 
-        if debug:
-            bench_elapse = time.time() - start_ts  # type: ignore[possibly-undefined]
-            autotuning_log.debug(
-                "InChildProcess %s: load %f, create tensor %f, bench %f",
-                str(self),
-                load_elapse,  # type: ignore[possibly-undefined]
-                create_tensor_elapse,  # type: ignore[possibly-undefined]
-                bench_elapse,
-            )
-        self.cleanup_run_fn()
-        return res
+            if debug:
+                bench_elapse = time.time() - start_ts  # type: ignore[possibly-undefined]
+                autotuning_log.debug(
+                    "InChildProcess %s: load %f, create tensor %f, bench %f",
+                    self,
+                    load_elapse,  # type: ignore[possibly-undefined]
+                    create_tensor_elapse,  # type: ignore[possibly-undefined]
+                    bench_elapse,
+                )
+            return res
+        finally:
+            self.cleanup_run_fn()
 
 
 class _TestBenchmarkRequest(BenchmarkRequest):
@@ -498,9 +620,9 @@ class _TestBenchmarkRequest(BenchmarkRequest):
     def __init__(
         self,
         result: float = 0.0,
-        device: Optional[int] = None,
-        sleep: Optional[float] = None,
-        exc: Optional[Exception] = None,
+        device: int | None = None,
+        sleep: float | None = None,
+        exc: Exception | None = None,
         crash: bool = False,
     ):
         self.result = result
@@ -510,10 +632,15 @@ class _TestBenchmarkRequest(BenchmarkRequest):
         self.crash = crash
 
     def benchmark(
-        self, *input_tensors: torch.Tensor, out: Optional[torch.Tensor] = None
+        self, *input_tensors: torch.Tensor, out: torch.Tensor | None = None
     ) -> float:
         if self.device is not None:
-            assert os.environ.get(CUDA_VISIBLE_DEVICES, None) == str(self.device)
+            visible_devices_env_var = get_visible_devices_env_var()
+            if os.environ.get(visible_devices_env_var, None) != str(self.device):
+                raise AssertionError(
+                    f"Expected {visible_devices_env_var}='{self.device}', "
+                    f"but got '{os.environ.get(visible_devices_env_var, None)}'"
+                )
         if self.sleep:
             time.sleep(self.sleep)
         if self.exc:
@@ -523,12 +650,52 @@ class _TestBenchmarkRequest(BenchmarkRequest):
         return self.result
 
 
+class _TestEnvBenchmarkRequest:
+    """
+    Supports unit testing subprocess environment propagation.
+    """
+
+    def __init__(self, key: str):
+        self.key = key
+
+    def benchmark(
+        self, *input_tensors: torch.Tensor, out: torch.Tensor | None = None
+    ) -> str | None:
+        return os.environ.get(self.key)
+
+
+@clear_on_fresh_cache
+class _TestCodeCache:
+    @classmethod
+    def cache_clear(cls) -> None:
+        cls.write.cache_clear()
+
+    @classmethod
+    @functools.lru_cache(None)
+    def write(cls, source_code: str) -> tuple[str, str]:
+        return write(source_code, "txt")
+
+
+class _TestCodeCacheBenchmarkRequest:
+    """
+    Supports unit testing subprocess codecache resets.
+    """
+
+    source_code = "test codecache contents\n"
+
+    def benchmark(
+        self, *input_tensors: torch.Tensor, out: torch.Tensor | None = None
+    ) -> str:
+        _, input_path = _TestCodeCache.write(self.source_code)
+        return input_path
+
+
 class GPUDeviceBenchmarkMixin:
     def do_bench(
         self,
         fn,
         *input_tensors: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
     ) -> float:
         device_idx_set = OrderedSet(
             tensor.device.index
@@ -537,7 +704,8 @@ class GPUDeviceBenchmarkMixin:
             and is_gpu(tensor.device.type)
             and tensor.device.index is not None
         )
-        assert len(device_idx_set) <= 1, f"Can not mix devices {device_idx_set}"
+        if not len(device_idx_set) <= 1:
+            raise AssertionError(f"Can not mix devices {device_idx_set}")
         device_type = next(
             (
                 tensor.device.type
@@ -552,7 +720,7 @@ class GPUDeviceBenchmarkMixin:
         else:
             device_idx = device_interface.current_device()
         with device_interface.device(device_idx):  # type: ignore[attr-defined]
-            res = benchmarker.benchmark_gpu(fn)
+            res = benchmarker.benchmark(fn, device=device_type)
             device_interface.synchronize()  # shake out any CUDA errors
 
         return res
@@ -563,19 +731,24 @@ class CPUDeviceBenchmarkMixin:
         self,
         fn,
         *input_tensors: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
     ) -> float:
         return benchmarker.benchmark_cpu(fn)
 
 
 class TritonBenchmarkRequest(BenchmarkRequest):
-    # Important: Instances of this class have to be serializable
-    # across process boundaries. Do not put CUDA Tensors in here!
+    """
+    Represents a standalone benchmark request for a Triton Template.
+
+    Important: Instances of this class have to be serializable
+    across process boundaries. Do not put CUDA Tensors in here!
+    """
+
     def __init__(
         self,
         kernel_name: str,
-        input_tensor_meta: Union[TensorMeta, list[TensorMeta]],
-        output_tensor_meta: Union[TensorMeta, list[TensorMeta]],
+        input_tensor_meta: TensorMeta | list[TensorMeta],
+        output_tensor_meta: TensorMeta | list[TensorMeta],
         extra_args: Iterable[Any],
         module_path: str,  # the path of the module defining the triton kernel
         module_cache_key: str,
@@ -585,7 +758,9 @@ class TritonBenchmarkRequest(BenchmarkRequest):
         num_buffers_warp_spec: int = 0,
         matrix_instr_nonkdim: int = 0,  # only used for hip to choose the shape of mfma instruction.
         waves_per_eu: int = 0,  # only used for hip to schedule waves per execution unit
-        kpack: int = 0,  # ROCm specific gemm paramete
+        kpack: int = 0,  # ROCm specific gemm parameter
+        workspace_size: int | None = None,  # size of workspace buffer in bytes
+        workspace_zero_fill: bool = False,  # whether to zero-fill workspace
     ) -> None:
         super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, extra_args)
         self.module_path = module_path
@@ -597,11 +772,20 @@ class TritonBenchmarkRequest(BenchmarkRequest):
         self.matrix_instr_nonkdim = matrix_instr_nonkdim
         self.waves_per_eu = waves_per_eu
         self.kpack = kpack
+        self.workspace_size = workspace_size
+        self.workspace_zero_fill = workspace_zero_fill
+        self._benchmark_module: Any | None = None
 
+    @override
     def make_run_fn(
         self, *input_tensors: torch.Tensor, out: torch.Tensor
     ) -> Callable[[], None]:
-        mod = PyCodeCache.load_by_key_path(self.module_cache_key, self.module_path)
+        mod = PyCodeCache.load_by_key_path(
+            self.module_cache_key,
+            self.module_path,
+            set_sys_modules=False,
+        )
+        self._benchmark_module = mod
         autotuning_log.debug(
             "benchmark module key: %s, path: %s",
             self.module_cache_key,
@@ -610,6 +794,23 @@ class TritonBenchmarkRequest(BenchmarkRequest):
 
         run_method = getattr(mod, self.kernel_name).run
         extra_args = list(self.extra_args)
+
+        # Recreate workspace tensor if needed (for TMA templates)
+        # The workspace tensor couldn't be pickled, so we recreate it here
+        # It should be inserted before the grid values (last 3 elements)
+        if self.workspace_size is not None:
+            from torch._inductor.select_algorithm import WORKSPACE_ARG_PLACEHOLDER
+
+            workspace_tensor = torch.empty(
+                (self.workspace_size,),
+                dtype=torch.uint8,
+                device=out.device,
+            )
+            if self.workspace_zero_fill:
+                workspace_tensor.zero_()
+            workspace_index = extra_args.index(WORKSPACE_ARG_PLACEHOLDER)
+            extra_args[workspace_index] = workspace_tensor
+
         run_method.__self__.with_bandwidth_info = False
 
         # Newer version of triton add warmup argument to JITFunction.run.
@@ -621,40 +822,104 @@ class TritonBenchmarkRequest(BenchmarkRequest):
             warmup_arg["warmup"] = False
 
         if out.device.type == "cpu":
-            stream = 0
+            device_interface = None
+            device_index = 0
         else:
             device_type = out.device.type
             device_interface = get_interface_for_device(device_type)
-            stream = device_interface.get_raw_stream(
-                self.output_tensor_meta.device.index
-            )
+            device_index = self.output_tensor_meta.device.index
 
-        if isinstance(
+        is_debug_autotuner = isinstance(
             getattr(mod, self.kernel_name),
             torch._inductor.runtime.triton_heuristics.DebugAutotuner,
-        ):
-            return functools.partial(
-                run_method,
-                *input_tensors,
-                out,
-                *extra_args,
-                **warmup_arg,
-                stream=stream,
+        )
+
+        # Resolve the stream at call time (not at closure-creation time) so that
+        # CUDA graph capture on a different stream works correctly.
+        def run_fn() -> None:
+            stream = (
+                0
+                if device_interface is None
+                else device_interface.get_raw_stream(device_index)
             )
-        else:
-            return functools.partial(
-                run_method,
-                *input_tensors,
-                out,
-                *extra_args,
-                **warmup_arg,
-                stream=stream,
-                benchmark_run=True,
+            if is_debug_autotuner:
+                run_method(
+                    *input_tensors,
+                    out,
+                    *extra_args,
+                    **warmup_arg,
+                    stream=stream,
+                )
+            else:
+                run_method(
+                    *input_tensors,
+                    out,
+                    *extra_args,
+                    **warmup_arg,
+                    stream=stream,
+                    benchmark_run=True,
+                )
+
+        return run_fn
+
+    def cleanup_run_fn(self) -> None:
+        # Authoritative cleanup for one benchmark module load. Higher-level
+        # finally blocks may call this again as safety nets, so keep it idempotent.
+        mod = self._benchmark_module
+        self._benchmark_module = None
+
+        cached_mod = PyCodeCache.modules_no_attr.pop(self.module_path, None)
+        if mod is None:
+            mod = cached_mod
+
+        if mod is not None:
+            kernel = getattr(mod, self.kernel_name, None)
+            release_benchmark_artifacts = getattr(
+                kernel, "release_benchmark_artifacts", None
             )
+            if release_benchmark_artifacts is not None:
+                release_benchmark_artifacts()
+            release_static_launchers = getattr(
+                kernel, "_release_static_launchers_except", None
+            )
+            if (
+                release_benchmark_artifacts is None
+                and release_static_launchers is not None
+            ):
+                release_static_launchers(None)
+            elif release_benchmark_artifacts is None:
+                for launcher in getattr(kernel, "launchers", ()) or ():
+                    close = getattr(getattr(launcher, "__self__", None), "close", None)
+                    if close is not None:
+                        close()
+                for compile_result in getattr(kernel, "compile_results", ()) or ():
+                    close = getattr(
+                        getattr(compile_result, "kernel", None), "close", None
+                    )
+                    if close is not None:
+                        close()
+
+        PyCodeCache.modules[:] = [
+            module
+            for module in PyCodeCache.modules
+            if getattr(module, "__file__", None) != self.module_path
+        ]
+        PyCodeCache.linemaps.pop(self.module_path, None)
 
     def precompile(self):
-        mod = PyCodeCache.load_by_key_path(self.module_cache_key, self.module_path)
-        getattr(mod, self.kernel_name).precompile()
+        try:
+            mod = PyCodeCache.load_by_key_path(
+                self.module_cache_key,
+                self.module_path,
+                set_sys_modules=False,
+            )
+            self._benchmark_module = mod
+            kernel = getattr(mod, self.kernel_name)
+            kernel.precompile()
+
+            self.n_regs = kernel.launchers[0].n_regs
+        finally:
+            self.cleanup_run_fn()
 
     def __str__(self) -> str:
         return f"{self.kernel_name=}, {self.module_path=}, {self.module_cache_key=}"
@@ -668,7 +933,147 @@ class TritonCPUBenchmarkRequest(CPUDeviceBenchmarkMixin, TritonBenchmarkRequest)
     pass
 
 
-class CUDABenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
+class ExternKernelBenchmarkRequest(BenchmarkRequest):
+    """
+    A class to handle extern kernel benchmark requests. This allows extern kernels
+    (like aten::mm) to be benchmarked in a subprocess, similar to Triton kernels.
+
+    Important: Instances of this class have to be serializable across
+    process boundaries. Do not put CUDA Tensors in here!
+    """
+
+    def __init__(
+        self,
+        kernel_name: str,
+        input_tensor_meta: TensorMeta | list[TensorMeta],
+        output_tensor_meta: TensorMeta | list[TensorMeta],
+        extra_args: Iterable[Any],
+        callable_path: str,  # Module path to the callable (e.g., "extern_kernels.mm")
+        kwargs: dict[str, Any] | None = None,
+        has_out_variant: bool = True,
+    ) -> None:
+        super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, extra_args)
+        self.callable_path = callable_path
+        self.kwargs = kwargs or {}
+        self.has_out_variant = has_out_variant
+
+    def make_run_fn(
+        self, *input_tensors: torch.Tensor, out: torch.Tensor
+    ) -> Callable[[], None]:
+        fn = self.to_callable()
+        if self.has_out_variant:
+            # For out=variant, pass output as keyword arg
+            return functools.partial(fn, *input_tensors, out=out)
+        else:
+            # For non-out variant, just call with inputs
+            return functools.partial(fn, *input_tensors)
+
+    def benchmark(self, *input_tensors: torch.Tensor, out: torch.Tensor | None = None):
+        if out is not None and out.numel() == 0:
+            # no need to run the kernel or do benchmarking
+            return 0.0
+        if self.has_out_variant or len(input_tensors) == 0:
+            return super().benchmark(*input_tensors, out=out)
+        else:
+            algo = self.to_callable()
+            out_new = algo(*input_tensors)
+            if out is not None:
+                torch._C._dynamo.guards.assert_size_stride(
+                    out_new, tuple(out.size()), tuple(out.stride())
+                )
+                out.copy_(out_new)  # for correctness checking
+            if self.benchmark_with_cudagraphs:
+                return benchmarker.benchmark_gpu_with_cuda_graph(
+                    lambda: algo(*input_tensors)
+                )
+            if config.profile_bandwidth_with_do_bench_using_profiling:
+                return do_bench_using_profiling(lambda: algo(*input_tensors))
+            return benchmarker.benchmark(algo, input_tensors, {})
+
+    def precompile(self) -> None:
+        # Extern kernels don't need precompilation - they're already compiled
+        pass
+
+    def to_callable(self):
+        # While ExternKernelChoice also has a to_callable method,
+        # we avoid calling the ExternKernelChoice version here to make sure
+        # this is picklable
+        from torch._inductor.select_algorithm import extern_kernels
+
+        fn = getattr(extern_kernels, self.kernel_name)
+        if self.kwargs:
+            return functools.partial(fn, **self.kwargs)
+
+        return fn
+
+    def __str__(self) -> str:
+        return f"ExternKernelBenchmarkRequest({self.callable_path})"
+
+
+class ExternKernelGPUBenchmarkRequest(
+    GPUDeviceBenchmarkMixin, ExternKernelBenchmarkRequest
+):
+    pass
+
+
+class ExternKernelCPUBenchmarkRequest(
+    CPUDeviceBenchmarkMixin, ExternKernelBenchmarkRequest
+):
+    pass
+
+
+class SubgraphBenchmarkRequest(BenchmarkRequest):
+    """
+    Benchmark request for subgraph choices.
+
+    Pre-compiles the subgraph in the main process and stores
+    the module path/cache key for loading in subprocess.
+    """
+
+    def __init__(
+        self,
+        kernel_name: str,
+        input_tensor_meta: TensorMeta | list[TensorMeta],
+        output_tensor_meta: TensorMeta | list[TensorMeta],
+        extra_args: Iterable[Any],
+        module_path: str,
+        module_cache_key: str,
+        sym_input_values: list[int],
+    ) -> None:
+        super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, extra_args)
+        self.module_path = module_path
+        self.module_cache_key = module_cache_key
+        self.sym_input_values = sym_input_values
+
+    def make_run_fn(
+        self, *input_tensors: torch.Tensor, out: torch.Tensor
+    ) -> Callable[[], None]:
+        mod = PyCodeCache.load_by_key_path(
+            self.module_cache_key,
+            self.module_path,
+            set_sys_modules=False,
+        )
+        sym_input_values = self.sym_input_values
+        # Create a new list each call since mod.call does args.clear()
+        return lambda: mod.call([*sym_input_values, *input_tensors])
+
+    def precompile(self) -> None:
+        # Module is already compiled in main process, no precompilation needed
+        pass
+
+    def __str__(self) -> str:
+        return f"SubgraphBenchmarkRequest({self.kernel_name}, {self.module_path})"
+
+
+class SubgraphGPUBenchmarkRequest(GPUDeviceBenchmarkMixin, SubgraphBenchmarkRequest):
+    pass
+
+
+class SubgraphCPUBenchmarkRequest(CPUDeviceBenchmarkMixin, SubgraphBenchmarkRequest):
+    pass
+
+
+class CUTLASSBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
     """
     A class to handle CUDA (CUTLASS) benchmark requests. This class is for
     managing the lifecycle of a CUDA kernel benchmark, including compiling
@@ -681,20 +1086,26 @@ class CUDABenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
     def __init__(
         self,
         kernel_name: str,
-        input_tensor_meta: Union[TensorMeta, list[TensorMeta]],
-        output_tensor_meta: Union[TensorMeta, list[TensorMeta]],
+        input_tensor_meta: TensorMeta | list[TensorMeta],
+        output_tensor_meta: TensorMeta | list[TensorMeta],
         extra_args: Iterable[Any],
         source_code: str,
+        device_type: str = "cuda",
     ) -> None:
         super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, extra_args)
         self.source_code = source_code
         self.workspace_size: int = 0
-        self.workspace: Optional[torch.Tensor] = None
-        self.DLL: Optional[DLLWrapper] = None
+        self.workspace: torch.Tensor | None = None
+        self.DLL: DLLWrapper | None = None
         self._workspace_size_updated = False
         self.hash_key: str = ""
         self.source_file: str = ""
-        self.hash_key, self.source_file = CUDACodeCache.write(self.source_code, "so")
+        self.device_type = device_type
+        self.codecache_cls = XPUCodeCache if device_type == "xpu" else CUDACodeCache
+        self.device_interface = get_interface_for_device(device_type)
+        self.hash_key, self.source_file = self.codecache_cls.write(
+            self.source_code, "so"
+        )
 
     def precompile(self):
         """
@@ -702,14 +1113,14 @@ class CUDABenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
         This may happen in a separate thread pool.
         """
         autotuning_log.debug("Precompiling %s", self)
-        CUDACodeCache.compile(self.source_code, "so")
+        self.codecache_cls.compile(self.source_code, "so")
         autotuning_log.debug("Done precompiling %s", self)
 
     def make_run_fn(
         self, *input_tensors: torch.Tensor, out: torch.Tensor
     ) -> Callable[[], None]:
         """
-        Create a function to run the CUDA kernel with the given input and output tensors.
+        Create a function to run the CUDA/XPU kernel with the given input and output tensors.
         """
 
         self.ensure_dll_loaded()
@@ -724,7 +1135,9 @@ class CUDABenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
             args,
             self.extra_args,
         )
-        stream_ptr = c_void_p(torch.cuda.current_stream().cuda_stream)
+        stream_ptr = c_void_p(
+            self.device_interface.get_raw_stream(self.device_interface.current_device())
+        )
         run_method = getattr(self.DLL, self.kernel_name)
         workspace_ptr = c_void_p(0)
         if self.workspace_size > 0:
@@ -764,10 +1177,12 @@ class CUDABenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
             return
         self.ensure_dll_loaded()
         unique_input_count = len(
-            {meta.name for meta in self.input_tensor_meta}  # noqa: set_linter
+            dict.fromkeys(meta.name for meta in self.input_tensor_meta)
         )
         args = [c_void_p(None) for _ in range(unique_input_count + 1)]
-        stream_ptr = c_void_p(torch.cuda.current_stream().cuda_stream)
+        stream_ptr = c_void_p(
+            self.device_interface.get_raw_stream(self.device_interface.current_device())
+        )
 
         run_method = getattr(self.DLL, self.kernel_name)
         # Retrieve workspace_size and initialize workspace.
@@ -781,10 +1196,10 @@ class CUDABenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
             None,  # null workspace ptr
             stream_ptr,
         )
-        torch.cuda.synchronize()  # shake out any CUDA errors
+        self.device_interface.synchronize()  # shake out any device errors
         self.workspace_size = c_workspace_size.value
         autotuning_log.debug(
-            "update_workspace_size called: new workspace size=%d, self.kernel_name=%s, self.source_file=%s, self.hash_key=%s, self.DLL=%s, args=%s, self.extra_args=%s",  # noqa: B950
+            "update_workspace_size called: new workspace size=%d, self.kernel_name=%s, self.source_file=%s, self.hash_key=%s, self.DLL=%s, args=%s, self.extra_args=%s",
             self.workspace_size,
             self.kernel_name,
             self.source_file,
@@ -797,9 +1212,10 @@ class CUDABenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
 
     def ensure_dll_loaded(self):
         if self.DLL is None:
-            self.DLL, self.hash_key, self.source_file = CUDACodeCache.load(
+            self.DLL, self.hash_key, self.source_file = self.codecache_cls.load(
                 self.source_code, "so"
             )
+        self.DLL.open()
 
     def cleanup_run_fn(self) -> None:
         if self.DLL is not None:
@@ -810,6 +1226,16 @@ class CUDABenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
     def __str__(self) -> str:
         return f"{self.kernel_name=}, {self.source_file=}, {self.hash_key=}"
 
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["DLL"] = None
+        state["workspace"] = None
+        state["_workspace_size_updated"] = False
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+
 
 class CppBenchmarkRequest(CPUDeviceBenchmarkMixin, BenchmarkRequest):
     # Important: Instances of this class have to be serializable
@@ -818,15 +1244,15 @@ class CppBenchmarkRequest(CPUDeviceBenchmarkMixin, BenchmarkRequest):
     def __init__(
         self,
         kernel_name: str,
-        input_tensor_meta: Union[TensorMeta, list[TensorMeta]],
-        output_tensor_meta: Union[TensorMeta, list[TensorMeta]],
+        input_tensor_meta: TensorMeta | list[TensorMeta],
+        output_tensor_meta: TensorMeta | list[TensorMeta],
         extra_args: Iterable[Any],
         source_code: str,
     ) -> None:
         super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, extra_args)
         self.source_code = source_code
         self.hash_key = get_hash(source_code)
-        self.DLL: Optional[Union[CDLL, ModuleType]] = None
+        self.DLL: CDLL | ModuleType | None = None
 
     def precompile(self):
         # Prepopulate CppCodeCache
@@ -850,7 +1276,11 @@ class CppBenchmarkRequest(CPUDeviceBenchmarkMixin, BenchmarkRequest):
         )
         run_method = getattr(self.DLL, self.kernel_name)
         # Assume only size with type ctypes.c_ulonglong in extra_args
-        assert all(isinstance(arg, ctypes.c_ulonglong) for arg in self.extra_args)
+        if not all(isinstance(arg, ctypes.c_ulonglong) for arg in self.extra_args):
+            raise AssertionError(
+                f"Expected all extra_args to be ctypes.c_ulonglong, got types: "
+                f"{[type(arg) for arg in self.extra_args if not isinstance(arg, ctypes.c_ulonglong)]}"
+            )
         run_method.argtypes = [ctypes.c_ulonglong] * (
             len(args) + len(list(self.extra_args))
         )
@@ -862,16 +1292,59 @@ class CppBenchmarkRequest(CPUDeviceBenchmarkMixin, BenchmarkRequest):
             *self.extra_args,
         )
 
-    def cleanup_run_fn(self) -> None:
-        if self.DLL is not None:
-            """
-            Check close attr due to it crash on Windows.
-            """
-            if hasattr(self.DLL, "close"):
-                self.DLL.close()
-
     def __str__(self) -> str:
         return f"{self.kernel_name=}"
+
+
+class CuteDSLBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
+    """Benchmark request for CuteDSL (CUTLASS Python DSL) kernels."""
+
+    def __init__(
+        self,
+        kernel_name: str,
+        input_tensor_meta: TensorMeta | list[TensorMeta],
+        output_tensor_meta: TensorMeta | list[TensorMeta],
+        extra_args: tuple[Any, ...],
+        source_code: PartialRender,
+    ) -> None:
+        super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, extra_args)
+
+        # Template-specific precompile hooks reuse the finalized module source in subprocesses.
+        self.source_code = source_code.finalize_all()
+        self.module_cache_key, self.module_path = PyCodeCache.write(self.source_code)
+
+    def make_run_fn(
+        self, *input_tensors: torch.Tensor, out: torch.Tensor
+    ) -> Callable[[], None]:
+        """
+        Create a function to run the CuteDSL kernel with the given input and output tensors.
+        Similar to TritonBenchmarkRequest.make_run_fn but for CuteDSL kernels.
+        """
+        mod = PyCodeCache.load_by_key_path(
+            self.module_cache_key,
+            self.module_path,
+            set_sys_modules=False,
+        )
+
+        # Logic replicated async_compile
+        from .codegen.cutedsl.cutedsl_kernel import MAIN_SUFFIX
+
+        main_func_name = f"{self.kernel_name}_{MAIN_SUFFIX}"
+
+        if not hasattr(mod, main_func_name):
+            available = [name for name in dir(mod) if callable(getattr(mod, name))]
+            raise RuntimeError(
+                f"Could not find CuteDSL main kernel function '{main_func_name}'. Available callables: {available}"
+            )
+
+        kernel_func = getattr(mod, main_func_name)
+
+        def run_kernel():
+            device_interface = get_interface_for_device("cuda")
+            stream = device_interface.get_raw_stream(out.device.index)
+            return kernel_func(*input_tensors, out, *self.extra_args, stream=stream)
+
+        return run_kernel
 
 
 @functools.cache
@@ -888,3 +1361,325 @@ def benchmark_in_sub_process(
     Do benchmarking in a subprocess and return the perf number (latency).
     """
     return get_tuning_process_pool().benchmark(choices)
+
+
+class AutotuneProcessPool:
+    """
+    Singleton pool manager for running autotuning (precompilation + benchmarking)
+    in a separate process.
+    """
+
+    _instance: AutotuneProcessPool | None = None
+    _lock: threading.Lock = threading.Lock()
+    _shutdown_for_inactivity: bool = False
+
+    def __init__(self):
+        self._pool: ProcessPoolExecutor | None = self._init_pool()
+        self._warmup_future: Future[Any] | None = None
+        self._warmup_start_time: float | None = None
+        self._timer: Timer | None = self._init_timer()
+
+    @classmethod
+    def get_instance(cls):
+        """Get or create the singleton pool instance."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    # num_workers=1 to avoid GPU contention during benchmarking
+                    cls._instance = cls()
+        return cls._instance
+
+    @property
+    def pool(self):
+        """Get the process pool."""
+        if not config.pipeline_max_autotune_gemm:
+            raise AssertionError(
+                "To use AutotuneProcessPool, pipeline_max_autotune_gemm must be enabled"
+            )
+        if self._pool is None:
+            self._pool = self._init_pool()
+            self._timer = self._init_timer()
+        return self._pool
+
+    def _init_timer(self) -> Timer | None:
+        if AUTOTUNE_POOL_INACTIVITY_TIMEOUT > 0:
+            return Timer(AUTOTUNE_POOL_INACTIVITY_TIMEOUT, self._on_inactivity_timeout)
+        return None
+
+    def _record_activity(self) -> None:
+        if self._timer is not None:
+            self._timer.record_call()
+
+    def _on_inactivity_timeout(self) -> None:
+        autotuning_log.info(
+            "AutotuneProcessPool shutting down due to inactivity (timeout=%ds)",
+            AUTOTUNE_POOL_INACTIVITY_TIMEOUT,
+        )
+
+        with self._lock:
+            if self._pool is not None:
+                self._pool.shutdown(wait=False)
+                self._pool = None
+            self._timer = None
+
+            # Mark that the pool was shut down for inactivity.
+            # This prevents the pool from being recreated on recompiles
+            # which likely do not require large amounts of autotuning.
+            AutotuneProcessPool._shutdown_for_inactivity = True
+
+    def _init_pool(self):
+        """
+        Get or create the process pool.
+
+        Uses ProcessPoolExecutor with 'spawn' context for CUDA safety.
+        ProcessPoolExecutor is lazily initialized - workers are not spawned
+        until the first submit() call, making this property non-blocking.
+        """
+        # Use 'spawn' context to avoid CUDA fork issues
+        # Workers are spawned lazily on first submit(), not here
+        ctx = mp.get_context("spawn")
+        pool = ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=ctx,
+        )
+        atexit.register(self._shutdown)
+        autotuning_log.info("AutotuneProcessPool created (workers spawn lazily)")
+
+        return pool
+
+    def warm_up(self) -> Future[Any]:
+        """
+        Submit a warmup job to eagerly spawn workers and initialize CUDA.
+
+        This is optional - call it early to hide spawn latency.
+        Returns the warmup future which can be ignored or awaited.
+        """
+        if self._warmup_future is None:
+            with self._lock:
+                if self._warmup_future is None:
+                    self._warmup_start_time = time.perf_counter()
+                    self._warmup_future = self.submit(
+                        _init_autotune_subprocess,
+                        fp32_precision=torch.backends.cuda.matmul.fp32_precision,
+                    )
+                    self._warmup_future.add_done_callback(self._on_warmup_complete)
+                    autotuning_log.info("Warmup job submitted")
+        # pyrefly: ignore[bad-return]
+        return self._warmup_future
+
+    def _on_warmup_complete(self, future: Future[Any]) -> None:
+        """Callback invoked when the warmup job completes."""
+        warmup_elapsed_time = None
+        if self._warmup_start_time is not None:
+            warmup_elapsed_time = time.perf_counter() - self._warmup_start_time
+
+        try:
+            result = future.result()
+            autotuning_log.info(
+                "AutotuneProcessPool warmup completed successfully in %.4f seconds: %s",
+                warmup_elapsed_time,
+                result,
+            )
+            self._record_activity()
+        except Exception as e:
+            autotuning_log.error(
+                "AutotuneProcessPool warmup failed after %.4f seconds",
+                warmup_elapsed_time,
+            )
+            raise e
+
+    def submit(self, fn, *args, **kwargs) -> Future[Any]:
+        """Submit a job to the pool and return a Future."""
+        future = self.pool.submit(
+            _run_with_subprocess_env,
+            fn,
+            _cache_env_for_subprocess(),
+            *args,
+            **kwargs,
+        )
+        if self._timer is not None:
+            future.add_done_callback(lambda _: self._record_activity())
+        return future
+
+    def _shutdown(self):
+        """Shutdown the pool on exit."""
+        if self._timer is not None:
+            self._timer.quit()
+            self._timer = None
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+            self._pool = None
+
+    @classmethod
+    def shutdown_instance(cls):
+        """Explicitly shutdown the singleton instance."""
+        if cls._instance is not None:
+            with cls._lock:
+                if cls._instance is not None:
+                    cls._instance._shutdown()
+                    cls._instance = None
+
+
+def use_pipelined_autotuning() -> bool:
+    return (
+        config.pipeline_max_autotune_gemm
+        and not AutotuneProcessPool._shutdown_for_inactivity
+    )
+
+
+def _init_autotune_subprocess(fp32_precision: str) -> bool:
+    """
+    Warmup function run in the autotune subprocess.
+    """
+    import torch
+
+    # Initialize dummy tensor for CUDA context
+    if torch.cuda.is_available():
+        torch.zeros(1, device="cuda")
+
+    torch.backends.cuda.matmul.fp32_precision = fp32_precision
+
+    return True
+
+
+def run_autotune_in_subprocess(
+    benchmark_request: BenchmarkRequest,
+) -> float:
+    """
+    Run autotuning benchmarks in a subprocess.
+
+    This function is submitted to AutotuneProcessPool and runs in isolation
+    to prevent GPU contention with the main compilation process.
+
+    Args:
+        picklable_choices: List of picklable choice information
+
+    Returns:
+        timing
+    """
+
+    try:
+        # Run the benchmark directly - bmreq is already a BenchmarkRequest
+        timing = benchmark_request.benchmark()
+
+        return timing
+
+    except Exception:
+        autotuning_log.warning(
+            "Failed to benchmark choice %s",
+            benchmark_request,
+            exc_info=True,
+        )
+        # Use infinity for failed benchmarks so they're not selected
+        return float("inf")
+
+
+class PrecompileThreadPool:
+    """
+    Thread pool for running precompilation asynchronously.
+
+    This allows the main compilation process to continue while
+    precompilation happens in background threads.
+    """
+
+    _instance: PrecompileThreadPool | None = None
+    _lock = threading.Lock()
+
+    def __init__(self, max_workers: int = 4):
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    @classmethod
+    def get_instance(cls) -> PrecompileThreadPool:
+        from torch._inductor.select_algorithm import get_num_workers
+
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls(get_num_workers())
+        return cls._instance
+
+    def submit(self, fn, *args, **kwargs):
+        ctx = contextvars.copy_context()
+        # Need to copy context so workers have access to the correct config settings
+        fn = functools.partial(ctx.run, fn)
+        return self._executor.submit(fn, *args, **kwargs)
+
+    def _shutdown(self, wait: bool = False):
+        return self._executor.shutdown(wait=wait)
+
+    @classmethod
+    def shutdown_instance(cls) -> None:
+        if cls._instance is not None:
+            with cls._lock:
+                if cls._instance is not None:
+                    cls._instance._shutdown(wait=False)
+                    cls._instance = None
+
+
+class AsyncAutotuner:
+    """
+    Handles asynchronous autotuning of kernel choices in a separate process.
+
+    This class manages the lifecycle of autotuning:
+    1. Accepts precompiled choices from the main process
+    2. Submits benchmarking work to AutotuneProcessPool
+    3. Returns results via a Future
+
+    Usage:
+        autotuner = AsyncAutotuner(choices)
+        autotuner.start()  # Kicks off async benchmarking
+        timings = autotuner.get_results()  # Blocks until complete
+    """
+
+    choice_hash_to_future = {}
+
+    @staticmethod
+    def get_choice_hash(choice: ChoiceCaller, inputs_key: str) -> str:
+        return choice.hash_key() + inputs_key
+
+    @classmethod
+    def start(cls, choices: list[ChoiceCaller], inputs_key: str):
+        """
+        Start asynchronous autotuning in a subprocess.
+
+        This method:
+        1. Extracts picklable benchmark requests from choices
+        2. Submits benchmarking work to AutotuneProcessPool
+        3. Returns immediately (non-blocking)
+        """
+
+        for choice in choices:
+            choice_hash = AsyncAutotuner.get_choice_hash(choice, inputs_key)
+
+            if choice_hash in AsyncAutotuner.choice_hash_to_future:
+                continue
+
+            if not getattr(choice, "bmreq", None) is not None:
+                raise AssertionError("bmreq is None for choice")
+
+            autotune_future = AutotuneProcessPool.get_instance().submit(
+                run_autotune_in_subprocess,
+                choice.bmreq,
+            )
+
+            AsyncAutotuner.choice_hash_to_future[choice_hash] = autotune_future
+
+    @classmethod
+    def get_results(
+        cls, choices: list[ChoiceCaller], inputs_key: str
+    ) -> dict[ChoiceCaller, float]:
+        """
+        Get autotuning results, blocking until complete.
+
+        Args:
+            timeout: Maximum time to wait in seconds. None means wait forever.
+
+        Returns:
+            Dict mapping ChoiceCaller to benchmark timing
+        """
+
+        timings = {}
+        for choice in choices:
+            choice_hash = AsyncAutotuner.get_choice_hash(choice, inputs_key)
+            timings[choice] = AsyncAutotuner.choice_hash_to_future[choice_hash].result()
+        return timings

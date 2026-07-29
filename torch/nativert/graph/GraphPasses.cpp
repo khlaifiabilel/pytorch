@@ -101,27 +101,33 @@ std::string selectScalarOverloadName(const Node& node) {
       "floor_divide_out",
       "_conj"};
   std::vector<std::string_view> atoms = c10::split(node.target(), '.');
-  TORCH_CHECK_GE(atoms.size(), 3);
+
+  if (atoms.size() < 3) {
+    return "";
+  }
 
   std::string ns = std::string{atoms[atoms.size() - 3]};
   std::string opName = std::string{atoms[atoms.size() - 2]};
   std::string overloadName = std::string{atoms[atoms.size() - 1]};
   if (overloadName != "Tensor" && overloadName != "Tensor_Tensor" &&
-      overloadName != "Tensor_mode") {
+      overloadName != "Tensor_mode" && overloadName != "default") {
     return overloadName;
   }
-  if (allowed.find(std::string{opName}) == allowed.end()) {
+  if (allowed.find(opName) == allowed.end()) {
     return overloadName;
   }
-  auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
-      fmt::format("{}::{}", ns, opName.c_str()).c_str(), overloadName.c_str());
-  if (schemaTypeMatch(op.schema(), node)) {
+  // The "default" overload is stored with an empty overload name in the
+  // dispatcher, so normalize before looking it up.
+  std::string lookupOverload = overloadName == "default" ? "" : overloadName;
+  auto op = c10::Dispatcher::singleton().findSchema(
+      {fmt::format("{}::{}", ns, opName.c_str()), lookupOverload});
+  if (!op || schemaTypeMatch(op->schema(), node)) {
     return overloadName;
   }
   for (const auto& variant :
        {"Scalar_mode", "Scalar", "Scalar_Tensor", "Tensor_Scalar"}) {
     if (auto schema = c10::Dispatcher::singleton().findSchema(
-            {fmt::format("{}::{}", ns, opName.c_str()).c_str(), variant})) {
+            {fmt::format("{}::{}", ns, opName.c_str()), variant})) {
       if (schemaTypeMatch(schema->schema(), node)) {
         return variant;
       }

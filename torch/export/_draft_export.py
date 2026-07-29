@@ -4,26 +4,38 @@ import logging
 import os
 import re
 import tempfile
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Callable, Optional, Union
+from typing import Any
 
 import torch
 import torch._logging._internal
-import torch._logging.structured
 import torch.utils._pytree as pytree
+from torch._dynamo.exc import UserError, UserErrorType
 from torch._export.passes.insert_custom_op_guards import (
     get_op_profiles,
     insert_custom_op_guards,
     OpProfile,
 )
+from torch._utils_internal import log_draft_export_usage
 
-from ._trace import _export
+from ._trace import _export, get_ep_stats
 from .dynamic_shapes import _DimHint, _DimHintType, Dim
 from .exported_program import ExportedProgram
 
 
 log = logging.getLogger(__name__)
+
+
+_DRAFT_EXPORT_WARNING_COLOR = "\033[31m"
+_DRAFT_EXPORT_SUCCESS_COLOR = "\033[32m"
+_DRAFT_EXPORT_END_COLOR = "\033[0m"
+
+
+def _format_colored(text: str, color: str) -> str:
+    return f"{color}{text}{_DRAFT_EXPORT_END_COLOR}"
 
 
 class FailureType(IntEnum):
@@ -43,7 +55,7 @@ def prettify_stack(stack: list[dict[str, str]], str_to_filename: dict[int, str])
             continue
 
         res += f"""
-        File {str_to_filename[frame['filename']]}, lineno {frame['line']}, in {frame['name']}"""  # type: ignore[index]
+        File {str_to_filename[frame["filename"]]}, lineno {frame["line"]}, in {frame["name"]}"""  # type: ignore[index]
 
     res += f"\n            {stack[-1]['loc']}"
     return res
@@ -68,7 +80,7 @@ def prettify_frame_locals(
     return res
 
 
-def get_loc(filename: str, lineno: int) -> Optional[str]:
+def get_loc(filename: str, lineno: int) -> str | None:
     try:
         with open(filename) as f:
             for i, line in enumerate(f):
@@ -98,7 +110,7 @@ class FailureReport:
     torch.ops.{op} is missing a fake kernel implementation.
 
     Please refer to https://docs.google.com/document/d/1_W62p8WJOQQUzPsJYa7s701JXt0qf2OfLub2sbkHOaU/edit#heading=h.ahugy69p2jmz for more detailed instructions on how to write a meta implementation.
-"""  # noqa: B950
+"""
 
         elif self.failure_type == FailureType.GUARD_ADDED:
             locals_info = (
@@ -137,7 +149,7 @@ class FailureReport:
 
     Please add `torch._check(...)` to the original code to assert this data-dependent assumption.
     Please refer to https://docs.google.com/document/d/1kZ_BbB3JnoLbUZleDT6635dHs88ZVYId8jT-yTFgf3A/edit#heading=h.boi2xurpqa0o for more details.
-"""  # noqa: B950
+"""
 
         elif self.failure_type == FailureType.MISMATCHED_FAKE_KERNEL:
             op = self.data["op"]
@@ -147,7 +159,7 @@ class FailureReport:
     The reason for the mismatch is: {reason}.
 
     Please refer to https://docs.google.com/document/d/1_W62p8WJOQQUzPsJYa7s701JXt0qf2OfLub2sbkHOaU/edit#heading=h.ahugy69p2jmz for more detailed instructions on how to write a fake implementation.
-"""  # noqa: B950
+"""
 
         else:
             raise ValueError(f"Unknown failure type: {self.failure_type}")
@@ -175,29 +187,31 @@ class DraftExportReport:
         return f"DraftExportReport({self.failures})"
 
     def __str__(self) -> str:
-        WARNING_COLOR = "\033[93m"
-        GREEN_COLOR = "\033[92m"
-        END_COLOR = "\033[0m"
-
         if self.successful():
-            return f"""{GREEN_COLOR}
+            return _format_colored(
+                """
 ##############################################################################################
-Congratuations: No issues are found during export, and it was able to soundly produce a graph.
+Congratulations: No issues are found during export, and it was able to soundly produce a graph.
 You can now change back to torch.export.export()
 ##############################################################################################
-{END_COLOR}"""
+""",
+                _DRAFT_EXPORT_SUCCESS_COLOR,
+            )
 
-        error = f"""{WARNING_COLOR}
+        error = _format_colored(
+            f"""
 ###################################################################################################
 WARNING: {len(self.failures)} issue(s) found during export, and it was not able to soundly produce a graph.
 Please follow the instructions to fix the errors.
 ###################################################################################################
 
-"""
+""",
+            _DRAFT_EXPORT_WARNING_COLOR,
+        )
+        error += "\n"
 
         for i, failure in enumerate(self.failures):
             error += f"{i + 1}. {failure.print(self.str_to_filename)}\n"
-        error += END_COLOR
         return error
 
     def apply_suggested_fixes(self) -> None:
@@ -292,6 +306,7 @@ class CaptureStructuredTrace(torch._logging._internal.LazyTraceHandler):
 
         self.logger.addHandler(self)
         self.prev_get_dtrace = torch._logging._internal.GET_DTRACE_STRUCTURED
+        # pyrefly: ignore [bad-assignment]
         torch._logging._internal.GET_DTRACE_STRUCTURED = True
         return self
 
@@ -299,6 +314,7 @@ class CaptureStructuredTrace(torch._logging._internal.LazyTraceHandler):
         self.log_record = LogRecord()
         self.expression_created_logs = {}
         self.logger.removeHandler(self)
+        # pyrefly: ignore [bad-assignment]
         torch._logging._internal.GET_DTRACE_STRUCTURED = self.prev_get_dtrace
         self.prev_get_dtrace = False
 
@@ -327,12 +343,12 @@ class CaptureStructuredTrace(torch._logging._internal.LazyTraceHandler):
                         # We don't want to log all expression_created logs, only
                         # the ones that are relevant to the
                         # guards/propagate_real_tensor
-                        self.expression_created_logs[
-                            metadata[key]["result_id"]
-                        ] = ExpressionCreatedNode(
-                            metadata[key]["result_id"],
-                            metadata[key].get("argument_ids", []),
-                            record,
+                        self.expression_created_logs[metadata[key]["result_id"]] = (
+                            ExpressionCreatedNode(
+                                metadata[key]["result_id"],
+                                metadata[key].get("argument_ids", []),
+                                record,
+                            )
                         )
                         return
 
@@ -362,22 +378,28 @@ class CaptureStructuredTrace(torch._logging._internal.LazyTraceHandler):
 def draft_export(
     mod: torch.nn.Module,
     args: tuple[Any, ...],
-    kwargs: Optional[dict[str, Any]] = None,
+    kwargs: Mapping[str, Any] | None = None,
     *,
-    dynamic_shapes: Optional[Union[dict[str, Any], tuple[Any], list[Any]]] = None,
+    dynamic_shapes: dict[str, Any] | tuple[Any] | list[Any] | None = None,
     preserve_module_call_signature: tuple[str, ...] = (),
     strict: bool = False,
     pre_dispatch: bool = True,
+    prefer_deferred_runtime_asserts_over_guards: bool = False,
 ) -> ExportedProgram:
+    start_time = time.time()
     kwargs = kwargs or {}
     dynamic_shapes = dynamic_shapes or {}
 
+    constraint_violation_msg = None
     capture_structured_log = CaptureStructuredTrace()
 
-    with torch._functorch.config.patch(
-        fake_tensor_propagate_real_tensors=True,
-        generate_fake_kernels_from_real_mismatches=True,
-    ), capture_structured_log:
+    with (
+        torch._functorch.config.patch(
+            fake_tensor_propagate_real_tensors=True,
+            generate_fake_kernels_from_real_mismatches=True,
+        ),
+        capture_structured_log,
+    ):
         try:
             new_shapes = None
             ep = _export(
@@ -388,26 +410,42 @@ def draft_export(
                 strict=strict,
                 pre_dispatch=pre_dispatch,
                 preserve_module_call_signature=preserve_module_call_signature,
+                prefer_deferred_runtime_asserts_over_guards=prefer_deferred_runtime_asserts_over_guards,
             )
-        except torch._dynamo.exc.UserError:
+        except Exception as exc:
+            if (
+                isinstance(exc, UserError)
+                and exc.error_type == UserErrorType.CONSTRAINT_VIOLATION
+            ):
+                constraint_violation_msg = exc.msg
 
-            def convert_dim_to_auto(dim: Any) -> Any:
-                if isinstance(dim, Dim):
-                    return Dim.AUTO(min=dim.min, max=dim.max)
-                elif isinstance(dim, _DimHint) and dim.type == _DimHintType.DYNAMIC:
-                    return Dim.AUTO(min=dim.min, max=dim.max)
-                return dim
+                def convert_dim_to_auto(dim: Any) -> Any:
+                    if isinstance(dim, Dim):
+                        return Dim.AUTO(min=dim.min, max=dim.max)
+                    elif isinstance(dim, _DimHint) and dim.type == _DimHintType.DYNAMIC:
+                        return Dim.AUTO(min=dim.min, max=dim.max)
+                    return dim
 
-            new_shapes = pytree.tree_map(convert_dim_to_auto, dynamic_shapes)
-            ep = _export(
-                mod,
-                args,
-                kwargs,
-                dynamic_shapes=new_shapes,
-                strict=strict,
-                pre_dispatch=pre_dispatch,
-                preserve_module_call_signature=preserve_module_call_signature,
-            )
+                new_shapes = pytree.tree_map(convert_dim_to_auto, dynamic_shapes)
+                ep = _export(
+                    mod,
+                    args,
+                    kwargs,
+                    dynamic_shapes=new_shapes,
+                    strict=strict,
+                    pre_dispatch=pre_dispatch,
+                    preserve_module_call_signature=preserve_module_call_signature,
+                    prefer_deferred_runtime_asserts_over_guards=prefer_deferred_runtime_asserts_over_guards,
+                )
+            else:
+                log_draft_export_usage(
+                    error=True,
+                    export_time=time.time() - start_time,
+                    strict=strict,
+                    message=str(exc),
+                    type=f"{type(exc).__name__}.{type(exc).__qualname__}",
+                )
+                raise exc
 
         torch._logging.dtrace_structured("exported_program", payload_fn=lambda: str(ep))
 
@@ -424,10 +462,10 @@ def draft_export(
                 continue
 
             elif log_name == "propagate_real_tensors_provenance":
-                log_contents[
-                    "occurrences"
-                ] = capture_structured_log.log_record.get_log_count(
-                    (log_name, log_contents)
+                log_contents["occurrences"] = (
+                    capture_structured_log.log_record.get_log_count(
+                        (log_name, log_contents)
+                    )
                 )
 
                 failure_type = FailureType.DATA_DEPENDENT_ERROR
@@ -449,7 +487,8 @@ def draft_export(
             else:
                 continue
 
-            assert failure_type is not None
+            if failure_type is None:
+                raise AssertionError("failure_type cannot be None at this point")
             failures.append(
                 FailureReport(
                     failure_type,
@@ -500,10 +539,18 @@ with torch._library.fake_profile.unsafe_generate_fake_kernels(ep._report.op_prof
         log.info(
             """
 ##############################################################################################
-Congratuations: No issues are found during export, and it was able to soundly produce a graph.
+Congratulations: No issues are found during export, and it was able to soundly produce a graph.
 You can now change back to torch.export.export()
 ##############################################################################################
     """
         )
 
+    log_draft_export_usage(
+        error=False,
+        export_time=time.time() - start_time,
+        strict=strict,
+        constraint_violations=constraint_violation_msg,
+        report=ep._report,
+        **get_ep_stats(ep),
+    )
     return ep

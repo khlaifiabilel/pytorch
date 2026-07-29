@@ -1,5 +1,4 @@
 #pragma once
-
 // DO NOT DEFINE STATIC DATA IN THIS HEADER!
 // See Note [Do not compile initializers with AVX]
 
@@ -31,7 +30,9 @@ class Vectorized<float> {
   static constexpr size_type size() {
     return 8;
   }
-  Vectorized() {}
+  Vectorized() {
+    values = _mm256_setzero_ps();
+  }
   Vectorized(__m256 v) : values(v) {}
   Vectorized(float val) {
     values = _mm256_set1_ps(val);
@@ -111,27 +112,23 @@ class Vectorized<float> {
     return b;
   }
   static Vectorized<float> loadu(const void* ptr, int64_t count = size()) {
-    if (count == size())
+    if (count >= size())
       return _mm256_loadu_ps(reinterpret_cast<const float*>(ptr));
-    __at_align__ float tmp_values[size()];
-    // Ensure uninitialized memory does not change the output value See
-    // https://github.com/pytorch/pytorch/issues/32502 for more details. We do
-    // not initialize arrays to zero using "={0}" because gcc would compile it
-    // to two instructions while a loop would be compiled to one instruction.
-    for (const auto i : c10::irange(size())) {
-      tmp_values[i] = 0.0;
-    }
-    std::memcpy(
-        tmp_values, reinterpret_cast<const float*>(ptr), count * sizeof(float));
-    return _mm256_loadu_ps(tmp_values);
+    // Masked load: lanes [0, count) are read, the rest are zero.
+    const __m256i mask = _mm256_cmpgt_epi32(
+        _mm256_set1_epi32(static_cast<int32_t>(count)),
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+    return _mm256_maskload_ps(reinterpret_cast<const float*>(ptr), mask);
   }
   void store(void* ptr, int64_t count = size()) const {
-    if (count == size()) {
+    if (count >= size()) {
       _mm256_storeu_ps(reinterpret_cast<float*>(ptr), values);
     } else if (count > 0) {
-      float tmp_values[size()];
-      _mm256_storeu_ps(reinterpret_cast<float*>(tmp_values), values);
-      std::memcpy(ptr, tmp_values, count * sizeof(float));
+      // Masked store: only lanes [0, count) are written.
+      const __m256i mask = _mm256_cmpgt_epi32(
+          _mm256_set1_epi32(static_cast<int32_t>(count)),
+          _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+      _mm256_maskstore_ps(reinterpret_cast<float*>(ptr), mask, values);
     }
   }
   const float& operator[](int idx) const = delete;
@@ -188,8 +185,11 @@ class Vectorized<float> {
   Vectorized<float> acos() const {
     return Vectorized<float>(Sleef_acosf8_u10(values));
   }
+  // Sleef acoshf/sinhf/coshf overflow for large float inputs where the scalar
+  // C library returns finite results, because Sleef uses float-range
+  // intermediates internally while the scalar C library uses double precision.
   Vectorized<float> acosh() const {
-    return Vectorized<float>(Sleef_acoshf8_u10(values));
+    return map(std::acosh);
   }
   Vectorized<float> asin() const {
     return Vectorized<float>(Sleef_asinf8_u10(values));
@@ -256,6 +256,63 @@ class Vectorized<float> {
   Vectorized<float> expm1() const {
     return Vectorized<float>(Sleef_expm1f8_u10(values));
   }
+  Vectorized<float> fexp_u20() const {
+    const __m256 vec_c0 = _mm256_set1_ps(0.00010703434948458272f);
+    const __m256 vec_c1 = _mm256_set1_ps(0.30354260500649682f);
+    const __m256 vec_c2 = _mm256_set1_ps(-0.22433836478672356);
+    const __m256 vec_c3 = _mm256_set1_ps(-0.079204240219773236);
+
+    const __m256 vec_exp_log2ef =
+        _mm256_castsi256_ps(_mm256_set1_epi32(0x3fb8aa3b)); // log2(e)
+
+    const __m256 vec_a = _mm256_set1_ps(std::pow(2, 23) / std::log2(2));
+    const __m256 vec_b = _mm256_set1_ps(std::pow(2, 23) * 127.f);
+
+    const __m256 vec_ln_flt_min =
+        _mm256_castsi256_ps(_mm256_set1_epi32(0xc2aeac50));
+    const __m256 vec_ln_flt_max =
+        _mm256_castsi256_ps(_mm256_set1_epi32(0x42b17218));
+    const __m256 vec_inf = _mm256_set1_ps(INFINITY);
+    const __m256 zero = _mm256_setzero_ps();
+
+    // exp(x) = 2**(x * log2(e))
+    //        = 2**xi * 2**xf   - TIPS we are using  the EEEE floating point
+    //        representation with identification to the exponent and the
+    //        mentissa
+    //  2**xf will be approximated to a polynomial of degree 3 computed with
+    //  Horner method
+    // compute the min/max for the mask
+    // Masks
+    __m256 mask_too_small =
+        _mm256_cmp_ps(values, vec_ln_flt_min, _CMP_LT_OS); // x < min
+    __m256 mask_too_large =
+        _mm256_cmp_ps(values, vec_ln_flt_max, _CMP_GT_OS); // x > max
+
+    // transformation with log2(e)
+    auto vec_src = _mm256_mul_ps(values, vec_exp_log2ef);
+    auto vec_fractional = _mm256_sub_ps(vec_src, _mm256_floor_ps(vec_src));
+
+    // compute polynomial using Horner Scheme
+    auto vec_res = _mm256_fmadd_ps(vec_fractional, vec_c3, vec_c2);
+    vec_res = _mm256_fmadd_ps(vec_fractional, vec_res, vec_c1);
+    vec_res = _mm256_fmadd_ps(vec_fractional, vec_res, vec_c0);
+
+    vec_src = _mm256_sub_ps(vec_src, vec_res);
+    // // the tips is here, headache in perspective
+    auto tmp = _mm256_fmadd_ps(vec_a, vec_src, vec_b);
+    // headache bis
+    __m256i casted_integer = _mm256_cvttps_epi32(tmp);
+    // bitwise to float for the final transformation
+    auto result = _mm256_castsi256_ps(casted_integer);
+    // boundary condition
+    // Set to 0 where x < ln(FLT_MIN)
+    result = _mm256_blendv_ps(result, zero, mask_too_small);
+    // Set to +inf where x > ln(FLT_MAX)
+    result = _mm256_blendv_ps(result, vec_inf, mask_too_large);
+    // final interpretation to float
+    return result;
+  }
+
   Vectorized<float> exp_u20() const {
     // A faster version of exp with ULP=20
     const __m256 vec_factorial_1 =
@@ -340,14 +397,17 @@ class Vectorized<float> {
   Vectorized<float> sin() const {
     return Vectorized<float>(Sleef_sinf8_u35(values));
   }
+  // Sleef sinhf/coshf overflow for large float inputs where std::sinh/cosh
+  // return finite results, because Sleef uses float-range intermediates
+  // internally while the scalar C library uses double precision.
   Vectorized<float> sinh() const {
-    return Vectorized<float>(Sleef_sinhf8_u10(values));
+    return map(std::sinh);
   }
   Vectorized<float> cos() const {
     return Vectorized<float>(Sleef_cosf8_u35(values));
   }
   Vectorized<float> cosh() const {
-    return Vectorized<float>(Sleef_coshf8_u10(values));
+    return map(std::cosh);
   }
   Vectorized<float> ceil() const {
     return _mm256_ceil_ps(values);
@@ -639,11 +699,27 @@ Vectorized<float> inline fmadd(
 }
 
 template <>
+Vectorized<float> inline fnmadd(
+    const Vectorized<float>& a,
+    const Vectorized<float>& b,
+    const Vectorized<float>& c) {
+  return _mm256_fnmadd_ps(a, b, c);
+}
+
+template <>
 Vectorized<float> inline fmsub(
     const Vectorized<float>& a,
     const Vectorized<float>& b,
     const Vectorized<float>& c) {
   return _mm256_fmsub_ps(a, b, c);
+}
+
+template <>
+Vectorized<float> inline fnmsub(
+    const Vectorized<float>& a,
+    const Vectorized<float>& b,
+    const Vectorized<float>& c) {
+  return _mm256_fnmsub_ps(a, b, c);
 }
 
 // TODO: rewrite with ATEN vectorized (need to add unpack and shuffle)

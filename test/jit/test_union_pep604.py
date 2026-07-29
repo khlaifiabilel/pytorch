@@ -20,7 +20,6 @@ from torch.testing._internal.common_utils import raise_on_run_directly
 from torch.testing._internal.jit_utils import JitTestCase, make_global
 
 
-@unittest.skipIf(sys.version_info < (3, 10), "Requires Python 3.10")
 class TestUnion(JitTestCase):
     """
     This class tests the functionality of `Union`.
@@ -127,8 +126,8 @@ class TestUnion(JitTestCase):
             scripted(1)
 
     def test_union_in_class_constructor(self):
-        @torch.jit.script  # noqa: B903
-        class A:  # noqa: B903
+        @torch.jit.script
+        class A:
             def __init__(self, x: int | str) -> None:
                 self.x = x
 
@@ -406,9 +405,7 @@ class TestUnion(JitTestCase):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "only int, float, "
-            "complex, Tensor, device and string keys "
-            "are supported",
+            "only int, float, complex, Tensor, device and string keys are supported",
         ):
             torch.jit.script(fn)
 
@@ -612,9 +609,7 @@ class TestUnion(JitTestCase):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "y is set to type str"
-            " in the true branch and type int "
-            "in the false branch",
+            "y is set to type str in the true branch and type int in the false branch",
         ):
             torch.jit.script(fn)
 
@@ -632,9 +627,7 @@ class TestUnion(JitTestCase):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "previously had type "
-            "str but is now being assigned to a"
-            " value of type int",
+            "previously had type str but is now being assigned to a value of type int",
         ):
             torch.jit.script(fn)
 
@@ -739,8 +732,7 @@ class TestUnion(JitTestCase):
             template,
             "List[str] | List[torch.Tensor]",
             lhs["list_literal_empty"],
-            "there are multiple possible List type "
-            "candidates in the Union annotation",
+            "there are multiple possible List type candidates in the Union annotation",
         )
 
         self._assert_passes(
@@ -783,21 +775,21 @@ class TestUnion(JitTestCase):
             template,
             "int | torch.Tensor",
             lhs["list_literal_empty"],
-            "Expected an Union type annotation with an inner List type",
+            "Expected a Union type annotation with an inner List type",
         )
 
         self._assert_raises(
             template,
             "int | torch.Tensor",
             lhs["list_literal_of_tensor"],
-            "Expected an Union type annotation with an inner List type",
+            "Expected a Union type annotation with an inner List type",
         )
 
         self._assert_raises(
             template,
             "int | torch.Tensor",
             lhs["list_comprehension_of_tensor"],
-            "Expected an Union type annotation with an inner List type",
+            "Expected a Union type annotation with an inner List type",
         )
 
         """
@@ -887,7 +879,7 @@ class TestUnion(JitTestCase):
             template,
             "List[str] | List[torch.Tensor]",
             lhs["dict_literal_empty"],
-            "Expected an Union type annotation with an inner Dict type",
+            "Expected a Union type annotation with an inner Dict type",
         )
 
         self._assert_passes(
@@ -906,8 +898,7 @@ class TestUnion(JitTestCase):
             template,
             "Dict[str, torch.Tensor] | Dict[str, int]",
             lhs["dict_literal_of_mixed"],
-            "none of those dict types can hold the "
-            "types of the given keys and values",
+            "none of those dict types can hold the types of the given keys and values",
         )
 
         # TODO: String frontend does not support tuple unpacking
@@ -971,14 +962,14 @@ class TestUnion(JitTestCase):
             template,
             "int | torch.Tensor",
             lhs["dict_literal_empty"],
-            "Expected an Union type annotation with an inner Dict type",
+            "Expected a Union type annotation with an inner Dict type",
         )
 
         self._assert_raises(
             template,
             "int | torch.Tensor",
             lhs["dict_literal_of_str_tensor"],
-            "Expected an Union type annotation with an inner Dict type",
+            "Expected a Union type annotation with an inner Dict type",
         )
 
         # See above--string frontend does not support tuple unpacking

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <ATen/core/ivalue.h>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 
 namespace c10d::symmetric_memory {
@@ -16,7 +17,7 @@ namespace c10d::symmetric_memory {
 // identical-sized memory via SymmetricMemoryAllocator::alloc(), then invokes
 // SymmetricMemoryAllocator::rendezvous() on the memory to establish the
 // association across peer buffers. The rendezvous is a one-time process, and
-// the mapping between a local memory memory and the associated SymmetricMemory
+// the mapping between a local memory and the associated SymmetricMemory
 // object is unique.
 //
 // NOTE [symmetric memory signal pad]
@@ -35,7 +36,7 @@ namespace c10d::symmetric_memory {
 // correctness of the barriers since signals issued from barrier on stream A
 // can be received by the barrier on stream B. By specifying different channels
 // for these two barriers, they can operate correctly in parallel.
-class TORCH_API SymmetricMemory : public c10::intrusive_ptr_target {
+class TORCH_API SymmetricMemory : public torch::CustomClassHolder {
  public:
   ~SymmetricMemory() override = default;
 
@@ -48,22 +49,29 @@ class TORCH_API SymmetricMemory : public c10::intrusive_ptr_target {
   virtual void** get_buffer_ptrs_dev() = 0;
   virtual void** get_signal_pad_ptrs_dev() = 0;
   virtual size_t get_buffer_size() = 0;
-  virtual size_t get_signal_pad_size() = 0;
+  size_t get_signal_pad_size();
+
+  virtual size_t get_offset() = 0;
 
   virtual bool has_multicast_support() = 0;
   virtual void* get_multicast_ptr() = 0;
 
-  virtual at::Tensor get_buffer(
+  at::Tensor get_buffer(
       int rank,
       c10::IntArrayRef sizes,
       c10::ScalarType dtype,
-      int64_t storage_offset) = 0;
+      int64_t storage_offset);
 
-  virtual at::Tensor get_signal_pad(
+  at::Tensor get_signal_pad(
       int rank,
       c10::IntArrayRef sizes,
       std::optional<c10::ScalarType> dtype = std::nullopt,
-      int64_t storage_offset = 0) = 0;
+      int64_t storage_offset = 0);
+
+  at::Tensor get_remote_tensor(
+      int peer,
+      c10::IntArrayRef sizes,
+      c10::ScalarType dtype);
 
   virtual void barrier(int channel, size_t timeout_ms) = 0;
   virtual void put_signal(int dst_rank, int channel, size_t timeout_ms) = 0;
@@ -71,12 +79,19 @@ class TORCH_API SymmetricMemory : public c10::intrusive_ptr_target {
 
   virtual int get_rank() = 0;
   virtual int get_world_size() = 0;
+  virtual c10::Device get_device() = 0;
 
-  virtual std::vector<int> get_rank_to_global_rank() {
+  virtual const std::vector<int>& get_rank_to_global_rank() {
     TORCH_CHECK(false, "NYI");
   }
 
   virtual int* get_rank_to_global_rank_dev() {
+    TORCH_CHECK(false, "NYI");
+  }
+
+  // Returns true if *all* peers within the group are accessible via direct
+  // memory load and store.
+  virtual bool world_within_direct_access() {
     TORCH_CHECK(false, "NYI");
   }
 };
@@ -96,12 +111,21 @@ class SymmetricMemoryAllocator : public c10::intrusive_ptr_target {
       void* ptr,
       const std::optional<std::string>& group_name) = 0;
   virtual bool has_multicast_support(int device_idx) = 0;
+  virtual c10::DeviceType supported_device_type() = 0;
+  virtual std::string name() = 0;
+  virtual bool has_allocation(void* ptr) {
+    return false;
+  }
 };
 
 C10_EXPORT bool is_finalizing();
 
 C10_EXPORT void register_allocator(
     c10::DeviceType device_type,
+    c10::intrusive_ptr<SymmetricMemoryAllocator> allocator);
+
+C10_EXPORT void register_availability(
+    const std::string& name,
     c10::intrusive_ptr<SymmetricMemoryAllocator> allocator);
 
 C10_EXPORT bool has_allocator(c10::DeviceType device_type);
@@ -127,7 +151,7 @@ struct GroupInfo {
   c10::intrusive_ptr<c10d::Store> store;
 };
 
-C10_EXPORT const GroupInfo& get_group_info(const std::string& group_name);
+C10_EXPORT GroupInfo& get_group_info(const std::string& group_name);
 
 // Identical to empty_strided, but allows symmetric memory access to be
 // established for the allocated tensor via SymmetricMemory::rendezvous(). This
@@ -169,4 +193,28 @@ TORCH_API c10::intrusive_ptr<SymmetricMemory> rendezvous(
 TORCH_API bool has_multicast_support(
     c10::DeviceType device_type,
     int device_idx);
+
+TORCH_API bool is_symm_mem_tensor(const at::Tensor& tensor);
+
+TORCH_API void set_backend(const std::string& name);
+
+TORCH_API std::optional<std::string> get_backend(c10::Device device);
+
+// Get the current signal pad size for symmetric memory allocations.
+// Returns the user-configured size if set, otherwise returns the default size.
+TORCH_API size_t get_signal_pad_size();
+
+// Set the signal pad size for future symmetric memory allocations.
+// This must be called before any symmetric memory allocations are made.
+// The size should be proportional to the number of blocks the user launches
+// and the world size.
+TORCH_API void set_signal_pad_size(size_t size);
+
+C10_EXPORT void register_mempool_allocator(
+    c10::DeviceType device_type,
+    std::shared_ptr<c10::Allocator> allocator);
+
+TORCH_API std::shared_ptr<c10::Allocator> get_mempool_allocator(
+    c10::Device device);
+
 } // namespace c10d::symmetric_memory

@@ -9,7 +9,7 @@ import unittest
 
 import torch
 from torch._inductor import config
-from torch.testing._internal.common_utils import IS_LINUX, skipIfXpu
+from torch.testing._internal.common_utils import IS_LINUX
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 
 
@@ -48,7 +48,6 @@ class TestKernelBestConfig(TestCase):
         config.max_autotune = cls.original_max_autotune
         super().tearDownClass()
 
-    @skipIfXpu
     def test_best_config_has_triton_cache_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             os.environ["TORCHINDUCTOR_CACHE_DIR"] = tmpdir
@@ -70,7 +69,7 @@ class TestKernelBestConfig(TestCase):
             self.assertGreater(
                 len(best_config_files),
                 0,
-                f"No best_config files found in {tmpdir}. Directory contents: {os.listdir(tmpdir)}",
+                lambda msg: f"{msg}\nNo best_config files found in {tmpdir}. Directory contents: {os.listdir(tmpdir)}",
             )
 
             # Validate that each best_config file contains a real triton_cache_hash,
@@ -81,13 +80,13 @@ class TestKernelBestConfig(TestCase):
                 self.assertIn(
                     "triton_cache_hash",
                     data,
-                    f"Missing triton_cache_hash in {os.path.basename(file_path)}",
+                    lambda msg: f"{msg}\nMissing triton_cache_hash in {os.path.basename(file_path)}",
                 )
                 cache_hash = data["triton_cache_hash"]
                 expected_path = os.path.join(triton_cache_dir, cache_hash)
                 self.assertTrue(
                     os.path.exists(expected_path),
-                    f"Triton cache directory missing: {expected_path}",
+                    lambda msg: f"{msg}\nTriton cache directory missing: {expected_path}",
                 )
 
 

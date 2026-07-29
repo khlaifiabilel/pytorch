@@ -31,7 +31,9 @@ class Vectorized<double> {
   static constexpr size_type size() {
     return 4;
   }
-  Vectorized() {}
+  Vectorized() {
+    values = _mm256_setzero_pd();
+  }
   Vectorized(__m256d v) : values(v) {}
   Vectorized(double val) {
     values = _mm256_set1_pd(val);
@@ -78,30 +80,21 @@ class Vectorized<double> {
     return b;
   }
   static Vectorized<double> loadu(const void* ptr, int64_t count = size()) {
-    if (count == size())
+    if (count >= size())
       return _mm256_loadu_pd(reinterpret_cast<const double*>(ptr));
-
-    __at_align__ double tmp_values[size()];
-    // Ensure uninitialized memory does not change the output value See
-    // https://github.com/pytorch/pytorch/issues/32502 for more details. We do
-    // not initialize arrays to zero using "={0}" because gcc would compile it
-    // to two instructions while a loop would be compiled to one instruction.
-    for (const auto i : c10::irange(size())) {
-      tmp_values[i] = 0.0;
-    }
-    std::memcpy(
-        tmp_values,
-        reinterpret_cast<const double*>(ptr),
-        count * sizeof(double));
-    return _mm256_load_pd(tmp_values);
+    // Masked load: lanes [0, count) are read, the rest are zero.
+    const __m256i mask = _mm256_cmpgt_epi64(
+        _mm256_set1_epi64x(count), _mm256_setr_epi64x(0, 1, 2, 3));
+    return _mm256_maskload_pd(reinterpret_cast<const double*>(ptr), mask);
   }
   void store(void* ptr, int count = size()) const {
-    if (count == size()) {
+    if (count >= size()) {
       _mm256_storeu_pd(reinterpret_cast<double*>(ptr), values);
     } else if (count > 0) {
-      double tmp_values[size()];
-      _mm256_storeu_pd(reinterpret_cast<double*>(tmp_values), values);
-      std::memcpy(ptr, tmp_values, count * sizeof(double));
+      // Masked store: only lanes [0, count) are written.
+      const __m256i mask = _mm256_cmpgt_epi64(
+          _mm256_set1_epi64x(count), _mm256_setr_epi64x(0, 1, 2, 3));
+      _mm256_maskstore_pd(reinterpret_cast<double*>(ptr), mask, values);
     }
   }
   const double& operator[](int idx) const = delete;
@@ -196,6 +189,9 @@ class Vectorized<double> {
     return Vectorized<double>(Sleef_expm1d4_u10(values));
   }
   Vectorized<double> exp_u20() const {
+    return exp();
+  }
+  Vectorized<double> fexp_u20() const {
     return exp();
   }
   Vectorized<double> fmod(const Vectorized<double>& q) const {
@@ -491,11 +487,27 @@ Vectorized<double> inline fmadd(
 }
 
 template <>
+Vectorized<double> inline fnmadd(
+    const Vectorized<double>& a,
+    const Vectorized<double>& b,
+    const Vectorized<double>& c) {
+  return _mm256_fnmadd_pd(a, b, c);
+}
+
+template <>
 Vectorized<double> inline fmsub(
     const Vectorized<double>& a,
     const Vectorized<double>& b,
     const Vectorized<double>& c) {
   return _mm256_fmsub_pd(a, b, c);
+}
+
+template <>
+Vectorized<double> inline fnmsub(
+    const Vectorized<double>& a,
+    const Vectorized<double>& b,
+    const Vectorized<double>& c) {
+  return _mm256_fnmsub_pd(a, b, c);
 }
 #endif
 

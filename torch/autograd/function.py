@@ -4,12 +4,12 @@ import inspect
 import itertools
 import warnings
 from collections import OrderedDict
-from typing import Any, Optional
-from typing_extensions import deprecated
+from collections.abc import Callable
+from typing import Any, Concatenate, TypeVar
+from typing_extensions import deprecated, ParamSpec
 
 import torch
 import torch._C as _C
-import torch._functorch as _functorch
 import torch.utils.hooks as hooks
 from torch._C import _functions
 from torch._functorch.autograd_function import custom_function_call
@@ -28,6 +28,10 @@ __all__ = [
 # Unique id provider for each class inheriting from Function
 # This is incremented in FunctionMeta during class definition
 AUTOGRAD_FUNCTION_COUNTER = itertools.count()
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+_P = ParamSpec("_P")
 
 
 # Formerly known as: _ContextMethodMixin
@@ -141,10 +145,11 @@ class FunctionCtx:
 
         """
         for tensor in tensors:
-            assert isinstance(tensor, torch.Tensor) or tensor is None, (
-                "save_for_forward expects all arguments to be tensors; you should "
-                "save non-tensors as attributes on ctx."
-            )
+            if not (isinstance(tensor, torch.Tensor) or tensor is None):
+                raise AssertionError(
+                    "save_for_forward expects all arguments to be tensors; you should "
+                    "save non-tensors as attributes on ctx."
+                )
 
         self.saved_for_forward = tensors
 
@@ -293,12 +298,7 @@ class BackwardCFunction(_C._FunctionBase, FunctionCtx, _HookMixin):
     This class is used for internal autograd work. Do not use.
     """
 
-    def apply(self, *args):
-        r"""
-        Apply method used when executing this Node during the backward
-        """
-        # _forward_cls is defined by derived class
-        # The user should define either backward or vjp but never both.
+    def _get_user_fn(self):
         backward_fn = self._forward_cls.backward  # type: ignore[attr-defined]
         vjp_fn = self._forward_cls.vjp  # type: ignore[attr-defined]
         if backward_fn is not Function.backward and vjp_fn is not Function.vjp:
@@ -307,8 +307,29 @@ class BackwardCFunction(_C._FunctionBase, FunctionCtx, _HookMixin):
                 "Function is not allowed. You should only implement one "
                 "of them."
             )
-        user_fn = vjp_fn if vjp_fn is not Function.vjp else backward_fn
+        return vjp_fn if vjp_fn is not Function.vjp else backward_fn
+
+    def apply(self, *args):
+        r"""
+        Apply method used when executing this Node during the backward.
+
+        Called by the autograd engine (non-boxed path) and by direct
+        grad_fn.apply() calls. When boxed_grads_call is True, boxes
+        grads into a mutable list before calling user's backward.
+        """
+        user_fn = self._get_user_fn()
+        fwd_cls = self._forward_cls  # type: ignore[attr-defined]  # pyrefly: ignore[missing-attribute]
+        if getattr(fwd_cls, "boxed_grads_call", False):
+            args = (list(args),)
         return user_fn(self, *args)
+
+    def apply_boxed(self, *args):
+        r"""
+        Apply method called by the autograd engine when boxed_grads_call
+        is True. Grads arrive as a single mutable list argument, allowing
+        backward to free individual grads mid-execution.
+        """
+        return self._get_user_fn()(self, *args)
 
     def apply_jvp(self, *args):
         r"""
@@ -335,9 +356,6 @@ class FunctionMeta(type):
             name + "Backward", (BackwardCFunction,), {"_forward_cls": cls}
         )
         backward_fn._autograd_function_id = next(AUTOGRAD_FUNCTION_COUNTER)  # type: ignore[attr-defined]
-        backward_fn._bw_module = None  # type: ignore[attr-defined]
-        if getattr(cls, "_lazy_backward_info", None):
-            backward_fn._bw_module = cls._lazy_backward_info.bw_module  # type: ignore[attr-defined]
         cls._backward_cls = backward_fn
 
         super().__init__(name, bases, attrs)
@@ -368,6 +386,7 @@ class _SingleLevelFunction(
             @staticmethod
             def forward(*args: Any, **kwargs: Any) -> Any:
                 pass
+
 
             @staticmethod
             def setup_context(ctx: Any, inputs: Tuple[Any, ...], output: Any) -> None:
@@ -440,6 +459,32 @@ class _SingleLevelFunction(
 
     # vjp and backward are alias of each other
     vjp = backward
+
+    """
+    Bool that specifies if PyTorch should clear saved tensors after the first
+    access to ``ctx.saved_tensors``. When set to True, accessing saved_tensors
+    clears the internal references, allowing the tensors to be cleared as soon
+    as the Tensor returned by saved_tensors is deleted.
+
+    This is useful for reducing memory pressure in backward passes when you
+    only need to access saved tensors once.
+
+    Default is False.
+    """
+    clear_saved_tensors_on_access = False
+
+    """
+    Bool that specifies if backward should receive grads as a single mutable
+    list argument instead of individual args in an immutable tuple. This allows
+    backward to free individual grads mid-execution by removing them from the
+    list, reducing peak memory.
+
+    When True, ``backward(ctx, grads)`` receives a single list instead of
+    ``backward(ctx, *grads)``.
+
+    Default is False.
+    """
+    boxed_grads_call = False
 
     @staticmethod
     def jvp(ctx: Any, *grad_inputs: Any) -> Any:
@@ -560,48 +605,41 @@ class Function(_SingleLevelFunction):
             "vmap staticmethod or set generate_vmap_rule=True."
         )
 
-    @classmethod
-    def apply(cls, *args, **kwargs):
-        def bind_default_args(func, *args, **kwargs):
-            signature = inspect.signature(func)
-            bound_args = signature.bind(*args, **kwargs)
-            bound_args.apply_defaults()
-
-            return bound_args.args
-
-        is_setup_ctx_defined = _is_setup_context_defined(cls.setup_context)
-        if is_setup_ctx_defined:
-            args = bind_default_args(cls.forward, *args, **kwargs)
-
-        if not torch._C._are_functorch_transforms_active():
-            # See NOTE: [functorch vjp and autograd interaction]
-            args = _functorch.utils.unwrap_dead_wrappers(args)
-            return super().apply(*args, **kwargs)  # type: ignore[misc]
-
-        if not is_setup_ctx_defined:
-            raise RuntimeError(
-                "In order to use an autograd.Function with functorch transforms "
-                "(vmap, grad, jvp, jacrev, ...), it must override the setup_context "
-                "staticmethod. For more details, please see "
-                "https://pytorch.org/docs/main/notes/extending.func.html"
-            )
-
-        return custom_function_call(cls, *args, **kwargs)
+    apply = _C._FunctionBase.__dict__["apply"]
 
     @staticmethod
     def _compiled_autograd_key(ctx):
         return (ctx._autograd_function_id,)
 
 
+def _bind_default_args(
+    func: Callable[_P, Any],
+    args: _P.args,  # type: ignore[valid-type]
+    kwargs: _P.kwargs,  # type: ignore[valid-type]
+) -> tuple[_P.args, _P.kwargs]:  # type: ignore[valid-type]
+    signature = inspect.signature(func)
+    bound_args = signature.bind(*args, **({} if kwargs is None else kwargs))
+    bound_args.apply_defaults()
+    return bound_args.args, bound_args.kwargs
+
+
+def _call_custom_function_call(cls, args, kwargs):
+    if kwargs is None:
+        return custom_function_call(cls, *args)
+    return custom_function_call(cls, *args, **kwargs)
+
+
 def _is_setup_context_defined(fn):
     return fn != _SingleLevelFunction.setup_context
 
 
-def once_differentiable(fn):
+def once_differentiable(
+    fn: Callable[Concatenate[_T, _P], _R],
+) -> Callable[Concatenate[_T, _P], _R]:
     @functools.wraps(fn)
-    def wrapper(ctx, *args):
+    def wrapper(ctx: _T, *args: _P.args, **kwargs: _P.kwargs) -> _R:
         with torch.no_grad():
-            outputs = fn(ctx, *args)
+            outputs = fn(ctx, *args, **kwargs)
 
         if not torch.is_grad_enabled():
             return outputs
@@ -622,12 +660,14 @@ def once_differentiable(fn):
             return outputs
 
         if not isinstance(outputs, tuple):
-            outputs = (outputs,)
+            outputs_ = (outputs,)
+        else:
+            outputs_ = outputs
 
         err_fn = _functions.DelayedError(
             b"trying to differentiate twice a function that was marked "
             b"with @once_differentiable",
-            len(outputs),
+            len(outputs_),
         )
 
         # Create aliases of each output that has requires_grad=True. We need
@@ -639,7 +679,7 @@ def once_differentiable(fn):
                 var.requires_grad = True
             return var
 
-        return err_fn(*[fake_requires_grad(v) for v in outputs])
+        return err_fn(*[fake_requires_grad(v) for v in outputs_])  # type: ignore[return-value]
 
     return wrapper
 
@@ -726,7 +766,7 @@ def _unflatten(input, proto):
     # unflatten a list or tuple input into a nested list/tuple structure
     # specified by proto
     def unflatten_helper(input, proto):
-        res: list[Optional[torch.Tensor]] = []
+        res: list[torch.Tensor | None] = []
         if hasattr(proto, "_jit_wrap"):
             return proto._jit_wrap(input)
         if not isinstance(proto, (list, tuple)):
@@ -769,6 +809,7 @@ class NestedIOFunction(Function):
     This class is here only for backward compatibility reasons.
     Use :class:`Function` instead of this for any new use case.
     """
+
     # The 'type: ignore' statements are needed here because these functions are declared as '@staticmethod' in the
     # superclass (Function) but are instance methods here, which mypy reports as incompatible.
 

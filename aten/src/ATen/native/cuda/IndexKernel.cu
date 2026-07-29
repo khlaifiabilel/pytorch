@@ -73,7 +73,6 @@ void gpu_index_kernel(TensorIteratorBase& iter, const IntArrayRef index_size, co
 
   char* const out_ptr = static_cast<char*>(iter.data_ptr(0));
   char* const in_ptr = static_cast<char*>(iter.data_ptr(1));
-
   if (is_gather_like && num_indices==1) {
       const size_t element_size = iter.element_size(0);
       constexpr size_t alignment = 16;
@@ -83,11 +82,10 @@ void gpu_index_kernel(TensorIteratorBase& iter, const IntArrayRef index_size, co
         auto ind_dim_size = index_size[0];
         auto inp_stride_bytes = index_stride[0];
         auto out_stride_bytes = iter.strides(0)[1];
-        if (iter.numel() == 0) return;
         at::native::vectorized_gather_kernel_launch<alignment, int64_t>(out_ptr, in_ptr, (int64_t*)iter.data_ptr(2), num_ind,
         slice_size, ind_dim_size, inp_stride_bytes, out_stride_bytes, /*allow_neg_indices*/true);
         return;
-      }
+    }
   }
 
   auto sizes = std::array<int64_t, MAX_DIMS>{};
@@ -227,6 +225,7 @@ static void index_kernel(
       AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
       AT_EXPAND(AT_FLOAT8_TYPES),
       kComplexHalf,
+      kBComplex32,
       kHalf,
       kBool,
       kBFloat16);
@@ -238,8 +237,9 @@ static void index_fill_kernel(
   const int64_t self_dim_size,
   const int64_t self_dim_stride,
   const Scalar& source) {
-  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND5(
     at::ScalarType::Half, at::ScalarType::Bool, at::ScalarType::BFloat16, kComplexHalf,
+    kBComplex32,
     iter.dtype(), "index_fill_cuda", [&] {
     using dtype = OpaqueType<sizeof(scalar_t)>;
     const auto fill_val = source.to<scalar_t>();
@@ -256,8 +256,9 @@ static void index_copy_kernel(
   // See note [Writing Nondeterministic Operations]
   // Nondeterministic when index contains duplicate entries
   // this kernel will not be called when torch.use_deterministic_algorithms(True)
-  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND5(
     at::ScalarType::Half, at::ScalarType::Bool, at::ScalarType::BFloat16, kComplexHalf,
+    kBComplex32,
     iter.dtype(), "index_copy_cuda", [&] {
     using dtype = OpaqueType<sizeof(scalar_t)>;
     index_copy_kernel_impl<dtype>(iter, dim, self_dim_size, self_dim_stride);
@@ -277,6 +278,7 @@ static void index_put_kernel(TensorIterator& iter, const IntArrayRef index_size,
     AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
     AT_EXPAND(AT_FLOAT8_TYPES),
     kComplexHalf,
+    kBComplex32,
     kHalf,
     kBool,
     kBFloat16);
@@ -325,7 +327,7 @@ void cuda_take_put_kernel(
   const auto offset_calc = make_offset_calculator<2>(iter);
   using uindex_t = std::make_unsigned_t<index_t>;
 
-  // OffsetCalculator needs the sizes and strides reveresed
+  // OffsetCalculator needs the sizes and strides reversed
   const auto indexed_sizes = std::vector<int64_t>(indexed.sizes().rbegin(), indexed.sizes().rend());
   const auto indexed_strides = std::vector<int64_t>(indexed.strides().rbegin(), indexed.strides().rend());
   const auto* indexed_strides_data = indexed_strides.data();
@@ -500,6 +502,7 @@ void flip_kernel(TensorIterator& iter, const bool quantized) {
       AT_EXPAND(AT_FLOAT8_TYPES),
       AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES),
       kComplexHalf,
+      kBComplex32,
       kHalf,
       kBool,
       kBFloat16);

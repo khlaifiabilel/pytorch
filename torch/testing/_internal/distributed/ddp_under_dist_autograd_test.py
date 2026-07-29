@@ -165,7 +165,11 @@ class HybridModel(nn.Module):
             RemoteEM.forward, self.remote_em_rref, input.sparse_features
         )
         # The same size of mini batch.
-        assert sparse.shape[0] == input.dense_features.shape[0]
+        if sparse.shape[0] != input.dense_features.shape[0]:
+            raise AssertionError(
+                f"Expected sparse.shape[0] == input.dense_features.shape[0], "
+                f"got {sparse.shape[0]} != {input.dense_features.shape[0]}"
+            )
         dense = self.fc1(input.dense_features)
         x = torch.cat((dense, sparse), 1)
         gLogger.debug("Concatenated feature: %s", x)
@@ -192,7 +196,7 @@ class Trainer:
         self.hybrid_module = HybridModel(
             self.remote_em_rref,
             self.remote_net_rref,
-            self.trainer_group if ddp_mode in (DdpMode.INSIDE,) else None,
+            self.trainer_group if ddp_mode == DdpMode.INSIDE else None,
         )
         self.ddp_params, self.non_ddp_params = (
             self.hybrid_module.ddp_params,
@@ -238,7 +242,9 @@ class Trainer:
             sparse_microbatch = torch.split(sparse_features, 2)
             values_microbatch = torch.split(values, 2)
             batches = []
-            for d, s, v in zip(dense_microbatch, sparse_microbatch, values_microbatch):
+            for d, s, v in zip(
+                dense_microbatch, sparse_microbatch, values_microbatch, strict=True
+            ):
                 feature_set = FeatureSet(dense_features=d, sparse_features=s, values=v)
                 batches.append(feature_set)
 
@@ -253,7 +259,11 @@ class Trainer:
             else:
                 input_batches = batches
 
-        with self.hybrid_module.join() if simulate_uneven_inputs else contextlib.nullcontext():
+        with (
+            self.hybrid_module.join()
+            if simulate_uneven_inputs
+            else contextlib.nullcontext()
+        ):
             for b in input_batches:
                 with dist_autograd.context() as context_id:
                     output = self.hybrid_module.forward(b)
@@ -261,8 +271,7 @@ class Trainer:
                     dist_autograd.backward(context_id, [loss])
                     grads_dict = dist_autograd.get_gradients(context_id)
                     gLogger.info(
-                        "Loss is %s for mini batch: %s. "
-                        "Grads dict has %s entries: %s",
+                        "Loss is %s for mini batch: %s. Grads dict has %s entries: %s",
                         loss,
                         mini_batch,
                         len(grads_dict),
@@ -294,7 +303,10 @@ def get_training_examples():
                     idx += 1
 
     # Split the examples among NUM_TRAINERS trainers
-    assert 0 == (n % NUM_TRAINERS)
+    if n % NUM_TRAINERS != 0:
+        raise AssertionError(
+            f"Expected n % NUM_TRAINERS == 0, got {n} % {NUM_TRAINERS} = {n % NUM_TRAINERS}"
+        )
     examples_per_trainer = int(n / NUM_TRAINERS)
     return [
         FeatureSet(
@@ -332,14 +344,18 @@ class DdpUnderDistAutogradTest(RpcAgentTestFixture):
         # The name has to be consistent with that in 'dist_init' decorator.
         return f"worker{rank}"
 
-    def _remote_worker_process(self, ddp_mode):
-        gLogger.info("The remote worker is running.")
+    def _init_process_group(self):
         dist.init_process_group(
             backend="gloo",
             init_method=INIT_METHOD_TEMPLATE.format(file_name=self.file_name),
             world_size=self.world_size,
             rank=self.rank,
         )
+        dist.barrier()
+
+    def _remote_worker_process(self, ddp_mode):
+        gLogger.info("The remote worker is running.")
+        self._init_process_group()
 
         if ddp_mode in (DdpMode.INSIDE, DdpMode.OUTSIDE):
             # new_group needs to be called on ranks.
@@ -358,12 +374,7 @@ class DdpUnderDistAutogradTest(RpcAgentTestFixture):
             rank,
             TRAINER_RANKS,
         )
-        dist.init_process_group(
-            backend="gloo",
-            init_method=INIT_METHOD_TEMPLATE.format(file_name=self.file_name),
-            world_size=self.world_size,
-            rank=self.rank,
-        )
+        self._init_process_group()
 
         gLogger.info("Waiting for shutdown signal on trainer #%s...", rank)
 
@@ -375,12 +386,7 @@ class DdpUnderDistAutogradTest(RpcAgentTestFixture):
 
     def _master_process(self, ddp_mode: DdpMode, simulate_uneven_inputs: bool):
         gLogger.info("Running the master process...")
-        dist.init_process_group(
-            backend="gloo",
-            init_method=INIT_METHOD_TEMPLATE.format(file_name=self.file_name),
-            world_size=self.world_size,
-            rank=self.rank,
-        )
+        self._init_process_group()
 
         remote_em_rref = rpc.remote(
             self.remote_worker_name(), RemoteEM, args=(NUM_EM_ROW, D_SPARSE)
@@ -460,7 +466,7 @@ class DdpUnderDistAutogradTest(RpcAgentTestFixture):
                     )
 
         # Destroy process groups
-        for idx, trainer_rref in enumerate(trainer_rrefs):
+        for trainer_rref in trainer_rrefs:
             _remote_method_async(Trainer.destroy_pg, trainer_rref).wait()
 
         # Send shutdown signals.

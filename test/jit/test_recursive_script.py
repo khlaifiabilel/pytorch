@@ -4,6 +4,7 @@
 import os
 import re
 import sys
+import threading
 import types
 import typing
 import typing_extensions
@@ -35,7 +36,7 @@ class TestRecursiveScript(JitTestCase):
                 self.x = None
 
             def forward(self):
-                assert self.x is None
+                assert self.x is None  # noqa: S101
 
         m = torch.jit.script(M())
         self.checkModule(M(), ())
@@ -591,6 +592,42 @@ class TestRecursiveScript(JitTestCase):
         ):
             jit_obj(1, 2, 3, 4)
 
+    def test_prepare_scriptable_already_scripted_with_ignored_child(self):
+        # Scripting a wrapper around an already-scripted child used to re-walk that
+        # child's _modules and re-assign its __jit_ignored_attributes__ submodule (a
+        # non-scripted nn.Module), raising "Cannot re-assign modules in a ScriptModule
+        # with non-scripted module". The _modules loop now skips already-scripted
+        # children, so re-scripting the wrapper succeeds.
+        class IgnoredChild(torch.nn.Module):
+            __jit_ignored_attributes__ = ["sub"]
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.sub = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                if torch.jit.is_scripting():
+                    return torch.zeros_like(x)
+                return self._real(x)
+
+            @torch.jit.ignore
+            def _real(self, x):
+                return self.sub(x)
+
+        class Wrapper(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, x):
+                return self.inner.forward(x)
+
+        inner = torch.jit.script(IgnoredChild())
+        self.assertIn("sub", dict(inner.named_children()))
+        scripted = torch.jit.script(Wrapper(inner))
+        t = torch.randn(2, 4)
+        self.assertEqual(scripted(t), torch.zeros_like(t))
+
     def test_attributes(self):
         @torch.jit.script
         class Inner2:
@@ -772,6 +809,25 @@ class TestRecursiveScript(JitTestCase):
         self.checkModule(mod, (torch.rand(2, 2),))
         mod.foo = None
         self.checkModule(mod, (torch.rand(2, 2),))
+
+    def test_thread_safe_error_stacks(self):
+        # prior to #160386, this causes a segfault. See [Note: Thread-safe CallStack]
+        callstacks = []
+
+        def callstack_creator():
+            factory = torch._C._jit_tree_views.SourceRangeFactory(
+                "source code", "a.py", 1, 0
+            )
+            x = torch._C.CallStack("a", factory.make_range(1, 0, 1))
+            callstacks.append(x)
+            del x
+
+        t = threading.Thread(target=callstack_creator)
+        t.start()
+        t.join()
+        del t
+        del callstacks[0]
+        self.assertTrue(len(callstacks) == 0)
 
     def test_override_instance_method_ignore(self):
         class M(torch.nn.Module):

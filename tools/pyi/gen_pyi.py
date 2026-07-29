@@ -150,8 +150,6 @@ blocklist = [
     "einsum",
     # Somehow, these are defined in both _C and in functional. Ick!
     "broadcast_tensors",
-    # Manually define named tensor type stubs in __init__.pyi.in
-    "align_tensors",
     "meshgrid",
     "cartesian_prod",
     "block_diag",
@@ -246,7 +244,8 @@ def sig_for_ops(opname: str) -> list[str]:
 
     # we have to do this by hand, because they are hand-bound in Python
 
-    assert opname.endswith("__") and opname.startswith("__"), f"Unexpected op {opname}"
+    if not (opname.endswith("__") and opname.startswith("__")):
+        raise AssertionError(f"Unexpected op {opname}")
 
     name = opname[2:-2]
     if name == "rpow":
@@ -255,9 +254,12 @@ def sig_for_ops(opname: str) -> list[str]:
         ]
     elif name in arithmetic_ops:
         if name.startswith("i"):
-            # In-place binary-operation dunder methods, like `__iadd__`, should return `Self`
+            # In-place binary-operation dunder methods, like `__iadd__`, should return `Self`.
+            # `__idiv__` is not a real Python 3 in-place dunder (Python 3 uses `__itruediv__` /
+            # `__ifloordiv__`), so ruff's PYI034 doesn't fire on it and the noqa would be unused.
+            suffix = "" if name == "idiv" else "  # noqa: PYI034"
             return [
-                f"def {opname}(self, other: Tensor | Number | _complex) -> Tensor: ...  # noqa: PYI034"
+                f"def {opname}(self, other: Tensor | Number | _complex) -> Tensor: ...{suffix}"
             ]
         return [f"def {opname}(self, other: Tensor | Number | _complex) -> Tensor: ..."]
     elif name in logic_ops:
@@ -271,7 +273,9 @@ def sig_for_ops(opname: str) -> list[str]:
             f"def {opname}(self, other: object) -> _bool: ...",
         ]
     elif name in asymmetric_comparison_ops:
-        return [f"def {opname}(self, other: Tensor | Number | _complex) -> Tensor: ..."]
+        return [
+            f"def {opname}(self, other: Tensor | Number | PySymType | _complex) -> Tensor: ..."
+        ]
     elif name in unary_ops:
         return [f"def {opname}(self) -> Tensor: ..."]
     if name in to_py_type_ops:
@@ -422,6 +426,19 @@ def gen_nn_functional(fm: FileManager) -> None:
                         "Tensor",
                     )
                 ],
+                f"max_pool{d}d_with_indices": [
+                    defs(
+                        f"max_pool{d}d_with_indices",
+                        [
+                            INPUT,
+                            KERNEL_SIZE,
+                            *STRIDE_PADDING,
+                            "dilation: _int | _size = 1",
+                            "ceil_mode: bool = False",
+                        ],
+                        "tuple[Tensor, Tensor]",
+                    )
+                ],
             }
         )
 
@@ -547,6 +564,255 @@ def gen_nn_functional(fm: FileManager) -> None:
                         KERNEL_SIZE,
                         "dilation: _int | _size",
                         *STRIDE_PADDING,
+                    ],
+                    "Tensor",
+                )
+            ],
+            "elu": [
+                defs(
+                    "elu",
+                    [
+                        INPUT,
+                        "alpha: float = 1.0",
+                        "scale: float = 1.0",
+                        "input_scale: float = 1.0",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "glu": [
+                defs(
+                    "glu",
+                    [
+                        INPUT,
+                        "dim: int = -1",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "max_unpool2d": [
+                defs(
+                    "max_unpool2d",
+                    [
+                        INPUT,
+                        "indices: Tensor",
+                        "output_size: Sequence[int] | None",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "max_unpool3d": [
+                defs(
+                    "max_unpool3d",
+                    [
+                        INPUT,
+                        "indices: Tensor",
+                        "output_size: Sequence[int] | None",
+                        "stride: _int | _size",
+                        "padding: _int | _size",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "cross_entropy_loss": [
+                defs(
+                    "cross_entropy_loss",
+                    [
+                        INPUT,
+                        "target: Tensor",
+                        "weight: Tensor | None = None",
+                        "reduction: str = ...",
+                        "ignore_index: int = -100",
+                        "label_smoothing: float = 0.0",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "hardsigmoid_": [
+                defs(
+                    "hardsigmoid_",
+                    [
+                        INPUT,
+                    ],
+                    "Tensor",
+                )
+            ],
+            "hardswish": [
+                defs(
+                    "hardswish",
+                    [
+                        INPUT,
+                    ],
+                    "Tensor",
+                )
+            ],
+            "hardswish_": [
+                defs(
+                    "hardswish_",
+                    [
+                        INPUT,
+                    ],
+                    "Tensor",
+                )
+            ],
+            "huber_loss": [
+                defs(
+                    "huber_loss",
+                    [
+                        INPUT,
+                        "target: Tensor",
+                        "reduction: str = ...",
+                        "delta: float = 1.0",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "im2col": [
+                defs(
+                    "im2col",
+                    [
+                        INPUT,
+                        KERNEL_SIZE,
+                        "dilation: _int | _size",
+                        "padding: _int | _size",
+                        "stride: _int | _size",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "l1_loss": [
+                defs(
+                    "l1_loss",
+                    [
+                        INPUT,
+                        "target: Tensor",
+                        "reduction: str = ...",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "mish": [
+                defs(
+                    "mish",
+                    [
+                        INPUT,
+                    ],
+                    "Tensor",
+                )
+            ],
+            "mish_": [
+                defs(
+                    "mish_",
+                    [
+                        INPUT,
+                    ],
+                    "Tensor",
+                )
+            ],
+            "mse_loss": [
+                defs(
+                    "mse_loss",
+                    [
+                        INPUT,
+                        "target: Tensor",
+                        "reduction: str = ...",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "multilabel_margin_loss": [
+                defs(
+                    "multilabel_margin_loss",
+                    [
+                        INPUT,
+                        "target: Tensor",
+                        "reduction: str = ...",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "multi_margin_loss": [
+                defs(
+                    "multi_margin_loss",
+                    [
+                        INPUT,
+                        "target: Tensor",
+                        "p: float = 1.0",
+                        "margin: float = 1.0",
+                        "weight: Tensor | None = None",
+                        "reduction: str = ...",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "nll_loss_nd": [
+                defs(
+                    "nll_loss_nd",
+                    [
+                        INPUT,
+                        "target: Tensor",
+                        "weight: Tensor | None = None",
+                        "reduction: str = ...",
+                        "ignore_index: int = -100",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "relu6": [
+                defs(
+                    "relu6",
+                    [
+                        INPUT,
+                    ],
+                    "Tensor",
+                )
+            ],
+            "relu6_": [
+                defs(
+                    "relu6_",
+                    [
+                        INPUT,
+                    ],
+                    "Tensor",
+                )
+            ],
+            "silu": [
+                defs(
+                    "silu",
+                    [
+                        INPUT,
+                    ],
+                    "Tensor",
+                )
+            ],
+            "silu_": [
+                defs(
+                    "silu_",
+                    [
+                        INPUT,
+                    ],
+                    "Tensor",
+                )
+            ],
+            "smooth_l1_loss": [
+                defs(
+                    "smooth_l1_loss",
+                    [
+                        INPUT,
+                        "target: Tensor",
+                        "reduction: str = ...",
+                        "beta: float = 1.0",
+                    ],
+                    "Tensor",
+                )
+            ],
+            "soft_margin_loss": [
+                defs(
+                    "soft_margin_loss",
+                    [
+                        INPUT,
+                        "target: Tensor",
+                        "reduction: str = ...",
                     ],
                     "Tensor",
                 )
@@ -728,10 +994,12 @@ def gather_docstrs() -> dict[str, str]:
 def add_docstr_to_hint(docstr: str, hint: str) -> str:
     docstr = inspect.cleandoc(docstr).strip()
     if "..." in hint:  # function or method
-        assert hint.endswith("..."), f"Hint `{hint}` does not end with '...'"
+        if not hint.endswith("..."):
+            raise AssertionError(f"Hint `{hint}` does not end with '...'")
         hint = hint.removesuffix("...").rstrip()  # remove "..."
         content = hint + "\n" + textwrap.indent(f'r"""\n{docstr}\n"""', prefix="    ")
         # Remove trailing whitespace on each line
+        # pyrefly: ignore [bad-argument-type]
         return "\n".join(map(str.rstrip, content.splitlines())).rstrip()
 
     # attribute or property
@@ -807,7 +1075,7 @@ def gen_pyi(
                         "dtype: _dtype | None = None",
                         "device: DeviceLikeType | None = None",
                         "copy: _bool | None = None",
-                        "requires_grad: _bool = False",
+                        "requires_grad: _bool | None = None",
                     ],
                     "Tensor",
                 )
@@ -912,6 +1180,27 @@ def gen_pyi(
                     "None",
                 )
             ],
+            "_functionalize_mutation_counter": [
+                defs(
+                    "_functionalize_mutation_counter",
+                    ["t: Tensor"],
+                    "_int",
+                )
+            ],
+            "_functionalize_storage_changed_counter": [
+                defs(
+                    "_functionalize_storage_changed_counter",
+                    ["t: Tensor"],
+                    "_int",
+                )
+            ],
+            "_functionalize_inductor_storage_resized_counter": [
+                defs(
+                    "_functionalize_inductor_storage_resized_counter",
+                    ["t: Tensor"],
+                    "_int",
+                )
+            ],
             "_functionalize_are_all_mutations_hidden_from_autograd": [
                 defs(
                     "_functionalize_are_all_mutations_hidden_from_autograd",
@@ -937,8 +1226,8 @@ def gen_pyi(
             "_functionalize_was_storage_changed": [
                 defs("_functionalize_was_storage_changed", ["tensor: Tensor"], "_bool")
             ],
-            "_functionalize_set_storage_changed": [
-                "def _functionalize_set_storage_changed(tensor: Tensor) -> _bool: ..."
+            "_functionalize_mark_storage_changed": [
+                "def _functionalize_mark_storage_changed(tensor: Tensor) -> _bool: ..."
             ],
             "_functionalize_has_metadata_mutation": [
                 defs(
@@ -1200,7 +1489,10 @@ def gen_pyi(
             # deprecated structseqs are currently not included for torch functions
             tuple_name, tuple_def = structseq
             if tuple_name in structseqs:
-                assert structseqs[tuple_name] == tuple_def
+                if structseqs[tuple_name] != tuple_def:
+                    raise AssertionError(
+                        f"Duplicate structseq {tuple_name} with different definition"
+                    )
             else:
                 structseqs[tuple_name] = tuple_def
 
@@ -1293,6 +1585,19 @@ def gen_pyi(
                         "dispatch_layout: _bool = False",
                         "_extra_dispatch_keys: torch.DispatchKeySet | None = None",
                         "storage_size: _int | SymInt | None = None",
+                    ],
+                    "S",
+                )
+            ],
+            "_dtensor__new__": [
+                "@staticmethod\n"
+                + defs(
+                    "_dtensor__new__",
+                    [
+                        "cls: type[S]",
+                        "local_tensor: Tensor",
+                        "spec: torch.distributed.tensor._dtensor_spec.DTensorSpec",
+                        "requires_grad: _bool",
                     ],
                     "S",
                 )
@@ -1401,7 +1706,6 @@ def gen_pyi(
                     "Tensor",
                 )
             ],
-            "has_names": [defs("has_names", ["self"], "_bool")],
             "is_contiguous": [
                 defs(
                     "is_contiguous",
@@ -1607,7 +1911,10 @@ def gen_pyi(
             # deprecated structseqs are currently not included for torch functions
             tuple_name, tuple_def = structseq
             if tuple_name in structseqs:
-                assert structseqs[tuple_name] == tuple_def
+                if structseqs[tuple_name] != tuple_def:
+                    raise AssertionError(
+                        f"Duplicate structseq {tuple_name} with different definition"
+                    )
             else:
                 structseqs[tuple_name] = tuple_def
 
@@ -1697,6 +2004,7 @@ def gen_pyi(
             "cfloat",
             "complex128",
             "cdouble",
+            "bcomplex32",
             "quint8",
             "qint8",
             "qint32",
@@ -1716,10 +2024,10 @@ def gen_pyi(
 
     # Include only the functions that contain hints, to prevent undefined
     # symbols to be included in the `__all__` directive.
-    hinted_function_names = [
+    hinted_function_names = {
         name for name, hint in unsorted_function_hints.items() if hint
-    ]
-    all_symbols = sorted(list(structseqs) + hinted_function_names)
+    }
+    all_symbols = sorted(hinted_function_names.union(structseqs))
     all_directive = [
         "__all__ = [",
         *(f'    "{name}",' for name in all_symbols),
@@ -1805,8 +2113,15 @@ def main() -> None:
         default=".",
         help="path to output directory",
     )
+    parser.add_argument(
+        "--template-dir",
+        default=".",
+        help="path to template directory",
+    )
     args = parser.parse_args()
-    fm = FileManager(install_dir=args.out, template_dir=".", dry_run=False)
+    fm = FileManager(
+        install_dir=args.out, template_dir=args.template_dir, dry_run=False
+    )
     gen_pyi(
         args.native_functions_path,
         args.tags_path,

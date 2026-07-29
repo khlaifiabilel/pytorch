@@ -22,7 +22,7 @@ namespace at::vec {
 // accessed as `at::vec`.
 inline namespace CPU_CAPABILITY {
 
-#if defined(CPU_CAPABILITY_SVE)
+#if defined(CPU_CAPABILITY_SVE256)
 
 template <>
 struct is_vec_specialized_for<double> : std::bool_constant<true> {};
@@ -38,7 +38,9 @@ class Vectorized<double> {
   static constexpr size_type size() {
     return VECTOR_WIDTH / sizeof(double);
   }
-  Vectorized() {}
+  Vectorized() {
+    values = svdup_n_f64(0);
+  }
   Vectorized(svfloat64_t v) : values(v) {}
   Vectorized(double val) {
     values = svdup_n_f64(val);
@@ -200,30 +202,35 @@ class Vectorized<double> {
     return USE_SLEEF(
         Vectorized<double>(Sleef_atanhdx_u10sve(values)), map(std::atanh));
   }
-  Vectorized<double> atan2(const Vectorized<double>& b) const {USE_SLEEF(
-      { return Vectorized<double>(Sleef_atan2dx_u10sve(values, b)); },
-      {
-        __at_align__ double tmp[size()];
-        __at_align__ double tmp_b[size()];
-        store(tmp);
-        b.store(tmp_b);
-        for (int64_t i = 0; i < size(); i++) {
-          tmp[i] = std::atan2(tmp[i], tmp_b[i]);
-        }
-        return loadu(tmp);
-      })} Vectorized<double> copysign(const Vectorized<double>& sign) const {
-      USE_SLEEF(
-          { return Vectorized<double>(Sleef_copysigndx_sve(values, sign)); },
-          {
-            __at_align__ double tmp[size()];
-            __at_align__ double tmp_sign[size()];
-            store(tmp);
-            sign.store(tmp_sign);
-            for (int64_t i = 0; i < size(); i++) {
-              tmp[i] = std::copysign(tmp[i], tmp_sign[i]);
-            }
-            return loadu(tmp);
-          })} Vectorized<double> erf() const {
+  Vectorized<double> atan2(const Vectorized<double>& b) const {
+    USE_SLEEF(
+        { return Vectorized<double>(Sleef_atan2dx_u10sve(values, b)); },
+        {
+          __at_align__ double tmp[size()];
+          __at_align__ double tmp_b[size()];
+          store(tmp);
+          b.store(tmp_b);
+          for (int64_t i = 0; i < size(); i++) {
+            tmp[i] = std::atan2(tmp[i], tmp_b[i]);
+          }
+          return loadu(tmp);
+        });
+  }
+  Vectorized<double> copysign(const Vectorized<double>& sign) const {
+    USE_SLEEF(
+        { return Vectorized<double>(Sleef_copysigndx_sve(values, sign)); },
+        {
+          __at_align__ double tmp[size()];
+          __at_align__ double tmp_sign[size()];
+          store(tmp);
+          sign.store(tmp_sign);
+          for (int64_t i = 0; i < size(); i++) {
+            tmp[i] = std::copysign(tmp[i], tmp_sign[i]);
+          }
+          return loadu(tmp);
+        });
+  }
+  Vectorized<double> erf() const {
     return USE_SLEEF(
         Vectorized<double>(Sleef_erfdx_u10sve(values)), map(std::erf));
   }
@@ -249,30 +256,38 @@ class Vectorized<double> {
   Vectorized<double> exp_u20() const {
     return exp();
   }
-  Vectorized<double> fmod(const Vectorized<double>& q) const {USE_SLEEF(
-      { return Vectorized<double>(Sleef_fmoddx_sve(values, q)); },
-      {
-        __at_align__ double tmp[size()];
-        __at_align__ double tmp_q[size()];
-        store(tmp);
-        q.store(tmp_q);
-        for (int64_t i = 0; i < size(); i++) {
-          tmp[i] = std::fmod(tmp[i], tmp_q[i]);
-        }
-        return loadu(tmp);
-      })} Vectorized<double> hypot(const Vectorized<double>& b) const {
-      USE_SLEEF(
-          { return Vectorized<double>(Sleef_hypotdx_u05sve(values, b)); },
-          {
-            __at_align__ double tmp[size()];
-            __at_align__ double tmp_b[size()];
-            store(tmp);
-            b.store(tmp_b);
-            for (int64_t i = 0; i < size(); i++) {
-              tmp[i] = std::hypot(tmp[i], tmp_b[i]);
-            }
-            return loadu(tmp);
-          })} Vectorized<double> i0() const {
+  Vectorized<double> fexp_u20() const {
+    return exp();
+  }
+  Vectorized<double> fmod(const Vectorized<double>& q) const {
+    USE_SLEEF(
+        { return Vectorized<double>(Sleef_fmoddx_sve(values, q)); },
+        {
+          __at_align__ double tmp[size()];
+          __at_align__ double tmp_q[size()];
+          store(tmp);
+          q.store(tmp_q);
+          for (int64_t i = 0; i < size(); i++) {
+            tmp[i] = std::fmod(tmp[i], tmp_q[i]);
+          }
+          return loadu(tmp);
+        });
+  }
+  Vectorized<double> hypot(const Vectorized<double>& b) const {
+    USE_SLEEF(
+        { return Vectorized<double>(Sleef_hypotdx_u05sve(values, b)); },
+        {
+          __at_align__ double tmp[size()];
+          __at_align__ double tmp_b[size()];
+          store(tmp);
+          b.store(tmp_b);
+          for (int64_t i = 0; i < size(); i++) {
+            tmp[i] = std::hypot(tmp[i], tmp_b[i]);
+          }
+          return loadu(tmp);
+        });
+  }
+  Vectorized<double> i0() const {
     return map(calc_i0);
   }
   Vectorized<double> i0e() const {
@@ -301,18 +316,21 @@ class Vectorized<double> {
     }
     return loadu(tmp);
   }
-  Vectorized<double> nextafter(const Vectorized<double>& b) const {USE_SLEEF(
-      { return Vectorized<double>(Sleef_nextafterdx_sve(values, b)); },
-      {
-        __at_align__ double tmp[size()];
-        __at_align__ double tmp_b[size()];
-        store(tmp);
-        b.store(tmp_b);
-        for (int64_t i = 0; i < size(); ++i) {
-          tmp[i] = std::nextafter(tmp[i], tmp_b[i]);
-        }
-        return loadu(tmp);
-      })} Vectorized<double> log() const {
+  Vectorized<double> nextafter(const Vectorized<double>& b) const {
+    USE_SLEEF(
+        { return Vectorized<double>(Sleef_nextafterdx_sve(values, b)); },
+        {
+          __at_align__ double tmp[size()];
+          __at_align__ double tmp_b[size()];
+          store(tmp);
+          b.store(tmp_b);
+          for (int64_t i = 0; i < size(); ++i) {
+            tmp[i] = std::nextafter(tmp[i], tmp_b[i]);
+          }
+          return loadu(tmp);
+        });
+  }
+  Vectorized<double> log() const {
     return USE_SLEEF(
         Vectorized<double>(Sleef_logdx_u10sve(values)), map(std::log));
   }
@@ -381,20 +399,23 @@ class Vectorized<double> {
   Vectorized<double> rsqrt() const {
     return svdivr_f64_x(ptrue, svsqrt_f64_x(ptrue, values), ONE_F64);
   }
-  Vectorized<double> pow(const Vectorized<double>& b) const {USE_SLEEF(
-      { return Vectorized<double>(Sleef_powdx_u10sve(values, b)); },
-      {
-        __at_align__ double tmp[size()];
-        __at_align__ double tmp_b[size()];
-        store(tmp);
-        b.store(tmp_b);
-        for (int64_t i = 0; i < size(); i++) {
-          tmp[i] = std::pow(tmp[i], tmp_b[i]);
-        }
-        return loadu(tmp);
-      })} // Comparison using the _CMP_**_OQ predicate.
-          //   `O`: get false if an operand is NaN
-          //   `Q`: do not raise if an operand is NaN
+  Vectorized<double> pow(const Vectorized<double>& b) const {
+    USE_SLEEF(
+        { return Vectorized<double>(Sleef_powdx_u10sve(values, b)); },
+        {
+          __at_align__ double tmp[size()];
+          __at_align__ double tmp_b[size()];
+          store(tmp);
+          b.store(tmp_b);
+          for (int64_t i = 0; i < size(); i++) {
+            tmp[i] = std::pow(tmp[i], tmp_b[i]);
+          }
+          return loadu(tmp);
+        });
+  }
+  // Comparison using the _CMP_**_OQ predicate.
+  //   `O`: get false if an operand is NaN
+  //   `Q`: do not raise if an operand is NaN
   Vectorized<double> operator==(const Vectorized<double>& other) const {
     svbool_t mask = svcmpeq_f64(ptrue, values, other);
     return svsel_f64(mask, ALL_F64_TRUE_MASK, ALL_F64_FALSE_MASK);
@@ -582,7 +603,31 @@ Vectorized<double> inline fmadd(
   return svmad_f64_x(ptrue, a, b, c);
 }
 
-#endif // defined(CPU_CAPABILITY_SVE)
+template <>
+Vectorized<double> inline fnmadd(
+    const Vectorized<double>& a,
+    const Vectorized<double>& b,
+    const Vectorized<double>& c) {
+  return svmsb_f64_x(ptrue, a, b, c);
+}
+
+template <>
+Vectorized<double> inline fmsub(
+    const Vectorized<double>& a,
+    const Vectorized<double>& b,
+    const Vectorized<double>& c) {
+  return svnmsb_f64_x(ptrue, a, b, c);
+}
+
+template <>
+Vectorized<double> inline fnmsub(
+    const Vectorized<double>& a,
+    const Vectorized<double>& b,
+    const Vectorized<double>& c) {
+  return svnmad_f64_x(ptrue, a, b, c);
+}
+
+#endif // defined(CPU_CAPABILITY_SVE256)
 
 } // namespace CPU_CAPABILITY
 } // namespace at::vec

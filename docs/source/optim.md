@@ -149,6 +149,24 @@ for input, target in dataset:
     Optimizer.zero_grad
 ```
 
+## Module-level hooks
+
+```{eval-rst}
+.. currentmodule:: torch.optim.optimizer
+
+.. autofunction:: register_optimizer_step_post_hook
+
+.. autofunction:: register_optimizer_step_pre_hook
+
+.. currentmodule:: torch.optim
+```
+
+## Utilities
+
+```{eval-rst}
+.. autofunction:: swap_in_optimizer_params_and_state
+```
+
 ## Algorithms
 
 ```{eval-rst}
@@ -165,6 +183,7 @@ for input, target in dataset:
     Adamax
     ASGD
     LBFGS
+    Muon
     NAdam
     RAdam
     RMSprop
@@ -210,6 +229,7 @@ Below is a table showing the available and default implementations of each algor
     :class:`Adamax`;foreach;yes;no
     :class:`ASGD`;foreach;yes;no
     :class:`LBFGS`;for-loop;no;no
+    :class:`Muon`;for-loop;no;no
     :class:`NAdam`;foreach;yes;no
     :class:`RAdam`;foreach;yes;no
     :class:`RMSprop`;foreach;yes;no
@@ -233,6 +253,7 @@ Below table is showing the stability status for fused implementations:
     :class:`Adamax`;unsupported;unsupported;unsupported
     :class:`ASGD`;unsupported;unsupported;unsupported
     :class:`LBFGS`;unsupported;unsupported;unsupported
+    :class:`Muon`;unsupported;unsupported;unsupported
     :class:`NAdam`;unsupported;unsupported;unsupported
     :class:`RAdam`;unsupported;unsupported;unsupported
     :class:`RMSprop`;unsupported;unsupported;unsupported
@@ -544,10 +565,13 @@ Decay is a parameter between 0 and 1 that controls how fast the averaged paramet
 {func}`torch.optim.swa_utils.get_ema_multi_avg_fn` returns a function that applies the following EMA equation to the weights:
 
 ```{math}
-W^\textrm{EMA}_{t+1} = \alpha W^\textrm{EMA}_{t} + (1 - \alpha) W^\textrm{model}_t
+W_0^{\text{EMA}} = W_0^{\text{model}}
 ```
 
-where alpha is the EMA decay.
+```{math}
+W_{t+1}^{\text{EMA}} = \text{decay} \times W_t^{\text{EMA}} + (1 - \text{decay}) \times W_{t+1}^{\text{model}}
+```
+ where `W_t^{\text{EMA}}` is the EMA parameter at step `t`, `W_t^{\text{model}}` is the model parameter at step `t`, and decay is the EMA decay rate (default: 0.999).
 
 Here the model `model` can be an arbitrary {class}`torch.nn.Module` object. `averaged_model`
 will keep track of the running averages of the parameters of the `model`. To update these
@@ -679,6 +703,9 @@ We train the model for a total of 300 epochs and start to collect EMA averages i
 
     swa_utils.AveragedModel
     swa_utils.SWALR
+    swa_utils.get_ema_avg_fn
+    swa_utils.get_swa_avg_fn
+    swa_utils.get_swa_multi_avg_fn
 
 
 .. autofunction:: torch.optim.swa_utils.get_ema_multi_avg_fn
@@ -688,20 +715,14 @@ We train the model for a total of 300 epochs and start to collect EMA averages i
 <!-- This module needs to be documented. Adding here in the meantime
 for tracking purposes -->
 ```{eval-rst}
-.. py:module:: torch.optim.adadelta
-.. py:module:: torch.optim.adagrad
-.. py:module:: torch.optim.adam
-.. py:module:: torch.optim.adamax
-.. py:module:: torch.optim.adamw
-.. py:module:: torch.optim.asgd
-.. py:module:: torch.optim.lbfgs
 .. py:module:: torch.optim.lr_scheduler
-.. py:module:: torch.optim.nadam
 .. py:module:: torch.optim.optimizer
-.. py:module:: torch.optim.radam
-.. py:module:: torch.optim.rmsprop
-.. py:module:: torch.optim.rprop
-.. py:module:: torch.optim.sgd
-.. py:module:: torch.optim.sparse_adam
 .. py:module:: torch.optim.swa_utils
+```
+
+```{eval-rst}
+.. toctree::
+    :hidden:
+
+    optim.aliases.md
 ```

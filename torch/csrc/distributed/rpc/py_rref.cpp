@@ -11,12 +11,12 @@
 
 namespace torch::distributed::rpc {
 
-/////////////////////  Pickle/Unpickle Helplers ////////////////////////////
+/////////////////////  Pickle/Unpickle Helpers ////////////////////////////
 
 namespace {
 
 py::tuple toPyTuple(const RRefForkData& rrefForkData) {
-  // add GIL as it is contructing a py::object
+  // add GIL as it is constructing a py::object
   pybind11::gil_scoped_acquire ag;
   return py::make_tuple(
       rrefForkData.ownerId_,
@@ -75,7 +75,7 @@ TypePtr tryInferTypeWithTypeHint(
         " is not a subtype of the type hint: ",
         type_qualified_name.qualifiedName(),
         ", did you pass a valid interface type?\n",
-        subtype_check_msg.str());
+        std::move(subtype_check_msg).str());
     return type_hint_ptr;
   } else {
     TORCH_CHECK(
@@ -110,7 +110,7 @@ TypePtr tryInferTypeWithTypeHint(
   }
 
   // Otherwise it's a pure pyobject, create the RRef
-  // that holds an IValue of an pyobject.
+  // that holds an IValue of a pyobject.
   return PyObjectType::get();
 }
 
@@ -321,7 +321,7 @@ void PyRRef::backwardOwnerRRef(
     py::object obj = torch::jit::toPyObject(value);
     try {
       value = torch::jit::toIValue(obj, c10::TensorType::get());
-    } catch (py::cast_error& e) {
+    } catch (py::cast_error&) {
       TORCH_CHECK(false, "RRef should contain a tensor for .backward()");
     }
   }

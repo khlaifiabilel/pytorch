@@ -27,10 +27,10 @@ Example usage:
 
 import enum
 import threading
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from dataclasses import dataclass, field  # noqa: F811
-from typing import Any, Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 
 class CallbackTrigger(enum.Enum):
@@ -39,7 +39,7 @@ class CallbackTrigger(enum.Enum):
     # backward compilation can be deferred to runtime
     LAZY_BACKWARD = 2
     # some backends autotune at runtime
-    TRITON_AUTOTUNING = 3
+    TRITON_AUTOTUNING = 3  # Temporarily disabled due to spam
     # cudagraphs record at runtime
     CUDAGRAPH_RECORDING = 4
 
@@ -126,15 +126,16 @@ class CompilationCallbackHandler:
         args = CallbackArgs(trigger, compile_id)
         try:
             with self.__pending_callbacks_counter_lock:
-                if self.__pending_callbacks_counter == 0:
-                    self.run_start_callbacks(args)
                 self.__pending_callbacks_counter += 1
+                if self.__pending_callbacks_counter == 1:
+                    self.run_start_callbacks(args)
             yield
         finally:
             with self.__pending_callbacks_counter_lock:
-                assert self.__pending_callbacks_counter > 0, (
-                    "Pending callbacks counter cannot become negative."
-                )
+                if self.__pending_callbacks_counter <= 0:
+                    raise AssertionError(
+                        "Pending callbacks counter cannot become negative."
+                    )
                 if self.__pending_callbacks_counter == 1:
                     self.run_end_callbacks(args)
                 self.__pending_callbacks_counter -= 1
@@ -145,7 +146,10 @@ class CompilationCallbackHandler:
         """
         self.start_callbacks.clear()
         self.end_callbacks.clear()
-        assert self.__pending_callbacks_counter == 0
+        if self.__pending_callbacks_counter != 0:
+            raise AssertionError(
+                f"Cannot clear callbacks while {self.__pending_callbacks_counter} are pending"
+            )
 
 
 callback_handler = CompilationCallbackHandler()

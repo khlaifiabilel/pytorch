@@ -13,6 +13,8 @@ mappings between nodes and their duplicates, enabling efficient graph analysis a
 optimization operations.
 """
 
+from __future__ import annotations
+
 import copyreg
 import io
 import logging
@@ -21,7 +23,7 @@ import operator
 import pickle
 from collections import defaultdict, deque
 from dataclasses import fields
-from typing import Any, Callable, Optional, TYPE_CHECKING, TypeVar
+from typing import Any, TYPE_CHECKING, TypeVar
 
 import torch._logging
 import torch.fx
@@ -36,13 +38,26 @@ T = TypeVar("T")
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .symbolic_convert import InstructionTranslatorBase
 
 
 Node = torch.fx.Node
 Region = list[Node]
 IdenticalNodes = list[Node]
-GlobalStateKey = tuple[bool, bool, int, bool, bool, torch.dtype, bool, bool, bool, bool]
+GlobalStateKey = tuple[
+    bool,
+    bool,
+    int,
+    tuple[bool, bool],
+    tuple[bool, bool],
+    torch.dtype,
+    bool,
+    bool,
+    bool,
+    bool,
+]
 
 log = logging.getLogger(__name__)
 graph_expansion_log = torch._logging.getArtifactLogger(
@@ -114,13 +129,25 @@ def _extract_args(arg: Any) -> Any:
 
 def _normalize_args(
     node: Node,
-) -> tuple[tuple[str, ...], tuple[Optional[Any], ...]]:
+) -> tuple[tuple[str, ...], tuple[Any | None, ...]]:
     flat_args, _ = tree_flatten(node.args)
     sorted_kwargs = sorted(node.kwargs.items(), key=operator.itemgetter(0))
     sorted_keys = tuple(sorted(node.kwargs.keys()))
     flat_kwargs, _ = tree_flatten(sorted_kwargs)
     all_args = flat_args + flat_kwargs
     return (sorted_keys, tuple(_extract_args(arg) for arg in all_args))
+
+
+def _sort_with_ref_region(
+    index_to_rank: dict[int, int], regions: list[list[Any]]
+) -> None:
+    # sort topologically
+    # we need to handle edge cases where some nodes have no dependencies
+    # so first we map each node to its ranking
+    ref_region = regions[0]
+    sorted_indices = sorted(range(len(ref_region)), key=lambda i: index_to_rank[i])
+    for region in regions:
+        region[:] = [region[i] for i in sorted_indices]
 
 
 def get_global_state_key() -> GlobalStateKey:
@@ -147,19 +174,20 @@ def get_global_state_key() -> GlobalStateKey:
 # of a node
 class BackwardBfsArgIter:
     def __init__(self, origin: Node) -> None:
-        self._cur: Optional[Node] = origin
-        self._queue: deque[Optional[Node]] = deque()
+        self._cur: Node | None = origin
+        self._queue: deque[Node | None] = deque()
 
     @staticmethod
-    def create(origin: Node) -> "BackwardBfsArgIter":
+    def create(origin: Node) -> BackwardBfsArgIter:
         it = BackwardBfsArgIter(origin)
         it.add_children(origin)
         # pop the origin node, since it is the origin of
         # the region and does not need to be considered for addition
-        assert it.next()
+        if not it.next():
+            raise AssertionError("expected origin node to be popped from iterator")
         return it
 
-    def next(self) -> Optional[Node]:
+    def next(self) -> Node | None:
         ret = self._cur
         if not self._queue:
             self._cur = None
@@ -167,7 +195,7 @@ class BackwardBfsArgIter:
             self._cur = self._queue.popleft()
         return ret
 
-    def peek(self) -> Optional[Node]:
+    def peek(self) -> Node | None:
         return self._cur
 
     def add_children(self, node: Node) -> None:
@@ -205,7 +233,7 @@ class GraphRegionTracker:
         self.input_pickler = InputPickler()
 
     def _hash_node(
-        self, filename: str, lineno: int, instruction_pointer: Optional[int], node: Node
+        self, filename: str, lineno: int, instruction_pointer: int | None, node: Node
     ) -> str:
         from torch._inductor.codecache import sha256_hash
 
@@ -226,20 +254,23 @@ class GraphRegionTracker:
             and n0 is not n1
         )
 
-    def track_node(self, tx: "InstructionTranslatorBase", node: Node) -> None:
+    def track_node(self, tx: InstructionTranslatorBase, node: Node) -> None:
         """
         The main entry point for tracking a node. This function will hash the node argument and group
         nodes with the same hash together. It updates the hash_to_duplicates and node_to_duplicates dictionaries
         to track the new node.
         """
         try:
-            duplicates = self.hash_to_duplicates[
-                self._hash_node(
-                    tx.f_code.co_filename, tx.lineno, tx.instruction_pointer, node
-                )
-            ]
-            duplicates.append(node)
-            self.node_to_duplicates[node] = duplicates
+            if (
+                node not in self.node_to_duplicates
+            ):  # don't allow nodes to be added twice
+                duplicates = self.hash_to_duplicates[
+                    self._hash_node(
+                        tx.f_code.co_filename, tx.lineno, tx.instruction_pointer, node
+                    )
+                ]
+                duplicates.append(node)
+                self.node_to_duplicates[node] = duplicates
         except NodeHashException as e:
             log.debug("Unable to hash node %s with exception %s", node, e)
 
@@ -301,8 +332,10 @@ class GraphRegionTracker:
         # the reason for this is that we will necessarily create the largest groups first.
         for group in self.hash_to_duplicates.values():
             if len(group) > 1:
+                # pyrefly: ignore [implicit-any]
                 region_group = []
                 min_rank = math.inf
+
                 for node in group:
                     # some nodes aren't in the topo ranking?
                     if node in topological_ranking:
@@ -327,8 +360,13 @@ class GraphRegionTracker:
                 self._is_identical,
             )
             # sort topologically
-            for region in region_group:
-                region.sort(key=lambda n: topological_ranking[n])
+            # we need to handle edge cases where some nodes have no dependencies
+            # so first we map each node to its ranking,
+            ref_region = region_group[0]
+            index_to_rank = {
+                index: topological_ranking[n] for index, n in enumerate(ref_region)
+            }
+            _sort_with_ref_region(index_to_rank, region_group)
 
         return [
             region_group for region_group in region_groups if len(region_group[0]) > 1
@@ -344,7 +382,8 @@ class RegionWrapper:
     def __init__(
         self, region: Region, node_to_recursive_ancestors: dict[Node, set[Node]]
     ) -> None:
-        assert len(region) == 1, "all regions should start with one node"
+        if len(region) != 1:
+            raise AssertionError("all regions should start with one node")
         node = region[0]
         self.node_to_recursive_ancestors = node_to_recursive_ancestors
         self.iter = BackwardBfsArgIter.create(node)
@@ -352,7 +391,7 @@ class RegionWrapper:
         self.ancestors = set(node_to_recursive_ancestors[node])
         self.region = region
 
-    def next_candidate(self) -> Optional[Node]:
+    def next_candidate(self) -> Node | None:
         return self.iter.next()
 
     def will_inclusion_create_cycle(self, node: Node) -> bool:
@@ -380,7 +419,8 @@ def fully_expand_region_group(
     debug_log("expanding new region group: %s", regions)
 
     # All regions should start with 1 node
-    assert all(len(region) == 1 for region in regions)
+    if not all(len(region) == 1 for region in regions):
+        raise AssertionError("all regions should start with one node")
     region_wrappers = [
         RegionWrapper(region, node_to_recursive_ancestors) for region in regions
     ]
@@ -422,6 +462,7 @@ def fully_expand_region_group(
                 candidate not in seen_nodes
                 and candidate not in nodes_to_add
                 and candidate.op != "placeholder"
+                and candidate.op != "get_attr"
                 and is_identical_fn(candidate, current_node)
                 and not region_wrapper.will_inclusion_create_cycle(candidate)
             )
@@ -431,9 +472,10 @@ def fully_expand_region_group(
             debug_log("--------------------")
 
         if add_to_all_regions:
-            assert len(region_wrappers) == len(nodes_to_add), (
-                "Numer of nodes to add must equal the number of regions"
-            )
+            if len(region_wrappers) != len(nodes_to_add):
+                raise AssertionError(
+                    "Number of nodes to add must equal the number of regions"
+                )
             for region_wrapper, node in zip(region_wrappers, nodes_to_add):
                 region_wrapper.add(node)
                 debug_log("adding %s's children", node)

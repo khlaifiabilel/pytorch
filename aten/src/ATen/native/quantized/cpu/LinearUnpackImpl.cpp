@@ -8,6 +8,7 @@
 #include <ATen/native/quantized/cpu/QnnpackUtils.h>
 #include <torch/custom_class.h>
 #include <torch/library.h>
+#include <utility>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -52,7 +53,7 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> PackedLinearWeight::unpack() {
   packB->unpack(weight_ptr_int8);
 
   return std::tuple<at::Tensor, std::optional<at::Tensor>>(
-      weight_origin, bias_);
+      std::move(weight_origin), bias_);
 }
 #endif // USE_FBGEMM
 
@@ -84,7 +85,7 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> PackedLinearWeightsQnnp::
           at::device(c10::kCPU).dtype(c10::kFloat));
 
       at::Tensor zero_points = at::empty(
-          w_zero_points.size() - kPaddingChannels, at::device(c10::kCPU).dtype(c10::kLong));
+          static_cast<int64_t>(w_zero_points.size() - kPaddingChannels), at::device(c10::kCPU).dtype(c10::kLong));
       for (const auto i : c10::irange(zero_points.numel())) {
         zero_points[i] = ((int64_t)w_zero_points[i] - 128);
       }
@@ -109,7 +110,7 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> PackedLinearWeightsQnnp::
     }
 
     return std::tuple<at::Tensor, std::optional<at::Tensor>>(
-        weight_origin, bias_);
+        std::move(weight_origin), bias_);
   }
 }
 #endif // USE_PYTORCH_QNNPACK

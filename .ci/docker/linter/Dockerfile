@@ -14,6 +14,11 @@ RUN bash ./install_base.sh && rm install_base.sh
 COPY ./common/install_user.sh install_user.sh
 RUN bash ./install_user.sh && rm install_user.sh
 
+# Install clang
+ARG CLANG_VERSION
+COPY ./common/install_clang.sh install_clang.sh
+RUN bash ./install_clang.sh && rm install_clang.sh
+
 # Install conda and other packages (e.g., numpy, pytest)
 ARG PYTHON_VERSION
 ENV PATH /var/lib/jenkins/ci_env/bin:$PATH
@@ -26,6 +31,8 @@ RUN bash ./install_python.sh && rm install_python.sh /opt/requirements-ci.txt
 COPY ./common/install_linter.sh install_linter.sh
 RUN bash ./install_linter.sh
 RUN rm install_linter.sh
+
+RUN chown -R jenkins:jenkins /var/lib/jenkins/ci_env
 
 USER jenkins
 CMD ["bash"]

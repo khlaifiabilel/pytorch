@@ -1,5 +1,4 @@
 # Owner(s): ["module: higher order operators"]
-# flake8: noqa: B950
 
 import contextlib
 import logging
@@ -186,7 +185,7 @@ class TestInvokeQuantInductor(TestInvokeQuant):
 
     @skipIfXpu(
         msg="MM Triton template fusion for XPU not work because the fusion"
-        " can not speedup, unskip untill #146568 fixed."
+        " can not speedup, unskip until #146568 fixed."
     )
     @requires_gpu()
     @config.patch(prologue_fusion=True)

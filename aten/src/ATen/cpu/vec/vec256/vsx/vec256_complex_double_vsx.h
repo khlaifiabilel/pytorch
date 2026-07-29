@@ -36,7 +36,7 @@ class Vectorized<ComplexDbl> {
   static constexpr size_type size() {
     return 2;
   }
-  Vectorized() {}
+  Vectorized() = default;
   C10_ALWAYS_INLINE Vectorized(vfloat64 v) : _vec0{v}, _vec1{v} {}
   C10_ALWAYS_INLINE Vectorized(vbool64 vmask) : _vecb0{vmask}, _vecb1{vmask} {}
   C10_ALWAYS_INLINE Vectorized(vfloat64 v1, vfloat64 v2)
@@ -478,7 +478,7 @@ class Vectorized<ComplexDbl> {
     this->store(tmp1);
     b.store(tmp2);
 
-    for (const auto i : c10::irange(Vectorized<c10::complex<float>>::size())) {
+    for (const auto i : c10::irange(Vectorized<c10::complex<double>>::size())) {
       out[i] = tmp1[i] / tmp2[i];
     }
     return loadu(out);

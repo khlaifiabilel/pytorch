@@ -6,14 +6,15 @@ import torch
 import torch.utils._pytree as pytree
 from torch._C import DispatchKey
 from torch._dispatch.python import suspend_functionalization
+from torch._higher_order_ops.auto_functionalize import FunctionalCallableWithEpilogue
 from torch._higher_order_ops.utils import (
     check_input_alias_and_mutation_return_outputs,
     HopInstance,
     materialize_as_graph,
     reenter_make_fx,
+    register_fake,
 )
 from torch._ops import HigherOrderOperator
-from torch._subclasses import FakeTensorMode
 from torch._subclasses.functional_tensor import disable_functional_mode
 from torch.fx.experimental.proxy_tensor import (
     disable_proxy_modes_tracing,
@@ -39,10 +40,13 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
         def __init__(self):
             return super().__init__("invoke_quant")
 
+
     invoke_quant = InvokeQuant()
+
 
     def g(x):
         return x.sin().cos()
+
 
     @torch.compile(backend="aot_eager")
     def f(x):
@@ -61,18 +65,26 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
         self.py_autograd_impl(self._call_Autograd)
         self.py_functionalize_impl(self._call_Functionalize)
         self.py_impl(ProxyTorchDispatchMode)(self._call_ProxyTorchDispatchMode)
-        self.py_impl(FakeTensorMode)(self._call_FakeTensorMode)
+        register_fake(self, self._fake_impl, skip_cache=True)
         self.py_impl(DispatchKey.CompositeExplicitAutograd)(
             self._call_CompositeExplicitAutograd
         )
 
     def __call__(self, subgraph, *operands, **kwargs):
-        if not isinstance(subgraph, (torch.fx.GraphModule, FunctionWithNoFreeVars)):
+        if not isinstance(
+            subgraph,
+            (
+                torch.fx.GraphModule,
+                FunctionWithNoFreeVars,
+                FunctionalCallableWithEpilogue,
+            ),
+        ):
             raise RuntimeError(
                 f"{self._name}: when calling this API without torch.compile, "
                 f"we require that the subgraph be a torch.fx.GraphModule (or "
                 f"a function we know doesn't have free variables)."
             )
+        # pyrefly: ignore [missing-attribute]
         return super().__call__(subgraph, *operands, **kwargs)
 
     def _call_Autograd(self, subgraph, *operands, **kwargs):
@@ -87,12 +99,16 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
         from torch.utils._python_dispatch import _get_current_dispatch_mode
 
         mode = _get_current_dispatch_mode()
-        assert mode is None, "Mode should never be enabled for CPU/CUDA key"
+        if mode is not None:
+            raise AssertionError("Mode should never be enabled for CPU/CUDA key")
         return subgraph(*operands)
 
     def _call_ProxyTorchDispatchMode(self, proxy_mode, subgraph, *operands, **kwargs):
         traced_graph = reenter_make_fx(subgraph)(*operands)
-        assert isinstance(proxy_mode.tracer, torch.fx.Tracer)
+        if not isinstance(proxy_mode.tracer, torch.fx.Tracer):
+            raise AssertionError(
+                f"expected proxy_mode.tracer to be torch.fx.Tracer, got {type(proxy_mode.tracer)}"
+            )
         qualname = proxy_mode.tracer.get_fresh_qualname("subgraph")
         proxy_mode.tracer.root.register_module(qualname, traced_graph)
 
@@ -105,13 +121,14 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
 
         out = self(subgraph, *operands, **kwargs)
         return track_tensor_tree(
-            out, out_proxy, constant=None, tracer=proxy_mode.tracer  # type: ignore[arg-type]
+            out,
+            out_proxy,
+            constant=None,
+            tracer=proxy_mode.tracer,  # type: ignore[arg-type]
         )
 
-    def _call_FakeTensorMode(self, mode, subgraph, *operands, **kwargs):
-        # TODO: this should probably route through FakeTensorMode to reuse caching
-        with mode:
-            return subgraph(*operands)
+    def _fake_impl(self, subgraph, *operands, **kwargs):
+        return subgraph(*operands)
 
     # NOTE [Support input mutation of hops]
     # To support input mutation, hop's subgraph must be functionalized because many inductor passes are
@@ -128,7 +145,7 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
     #          could recursively run passes on them. Also the epilogue graph is inlined at the end.
     #       b. we call auto_functionalized_v2 and pass in an additional schema in order to properly invoke
     #          the hop with normalized kwargs.
-    #   3. In inductor, we decompose the auto_functionalized hop by callilng into the dense implementation, which
+    #   3. In inductor, we decompose the auto_functionalized hop by calling into the dense implementation, which
     #      copies the mutated inputs to the hop if necessary and call the hop.
     # After these steps, the rest of the inductor stack knows how to fuse the copy_ in subgraph with other ops.
     def _call_Functionalize(self, ctx, subgraph, *operands, **kwargs):
@@ -156,23 +173,18 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
             out = self(functionalized_subgraph, *unwrapped_operands, **kwargs)
         return ctx.wrap_tensors(out)
 
+    # pyrefly: ignore [bad-override]
     def gen_schema(self, subgraph, *operands, **kwargs):
         from .schema import HopSchemaGenerator
 
-        if not isinstance(subgraph, torch.fx.GraphModule):
-            subgraph = materialize_as_graph(subgraph, operands)
-
-        fake_args = [
-            ph.meta["example_value"] if "example_value" in ph.meta else ph.meta["val"]
-            for ph in subgraph.graph.find_nodes(op="placeholder")
-        ]
+        subgraph = materialize_as_graph(subgraph, operands)
         (
             inp_inp_alias,
             inp_out_alias,
             out_out_alias,
             mutated_inp_idx,
             output,
-        ) = check_input_alias_and_mutation_return_outputs(subgraph, fake_args)
+        ) = check_input_alias_and_mutation_return_outputs(subgraph)
 
         if not (
             len(inp_inp_alias) == 0
@@ -184,10 +196,11 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
             import warnings
 
             warnings.warn(
-                "Aliasing is not suppported for HOP subgraph.\n"
+                "Aliasing is not supported for HOP subgraph.\n"
                 f"{subgraph.print_readable(print_output=False)}\n"
                 f"Alias info: inp-inp alias: {inp_inp_alias}, inp-out alias: {inp_out_alias}, out-out alias{out_out_alias}"
-                f"This may lead to silent incorrectness."
+                f"This may lead to silent incorrectness.",
+                stacklevel=2,
             )
 
         schema_gen = HopSchemaGenerator(self)
@@ -206,6 +219,7 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
 
 class BaseHOPFunction(torch.autograd.Function):
     @staticmethod
+    # pyrefly: ignore [bad-override]
     def forward(ctx, hop, subgraph, kwargs, *operands):
         ctx.hop = hop
         ctx.operands = operands
@@ -222,7 +236,11 @@ class BaseHOPFunction(torch.autograd.Function):
         kwargs = ctx.kwargs
 
         # TODO: Something special needs to happen with min cut partitioner
-        with suspend_functionalization(), disable_functional_mode(), torch.enable_grad():
+        with (
+            suspend_functionalization(),
+            disable_functional_mode(),
+            torch.enable_grad(),
+        ):
             with disable_proxy_modes_tracing():
                 from .invoke_subgraph import create_fw_bw_graph
                 from .utils import _from_fun

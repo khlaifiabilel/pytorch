@@ -8,6 +8,7 @@
 #include <torch/csrc/autograd/variable.h>
 #include <torch/csrc/dynamo/compiled_autograd.h>
 
+#include <ATen/Context.h>
 #include <ATen/DeviceAccelerator.h>
 #include <ATen/DeviceGuard.h>
 #include <ATen/ExpandUtils.h>
@@ -75,17 +76,17 @@ inline bool should_run_in_cpu_ready_queue(c10::DeviceType device) {
 std::atomic<Engine::compiled_autograd_fn> the_compiled_autograd = nullptr;
 #define COMPILED_AUTOGRAD_POISON \
   reinterpret_cast<Engine::compiled_autograd_fn>(1)
-std::atomic<int32_t> num_threads_in_backwards;
+std::atomic<int32_t> num_threads_in_compiled_autograd;
 struct CompiledAutogradThreadingDebugCheck {
   CompiledAutogradThreadingDebugCheck() {
-    num_threads_in_backwards++;
+    num_threads_in_compiled_autograd++;
   }
   ~CompiledAutogradThreadingDebugCheck() {
     release();
   }
   void release() {
     if (std::exchange(incremented, false)) {
-      num_threads_in_backwards--;
+      num_threads_in_compiled_autograd--;
     }
   }
 
@@ -204,7 +205,10 @@ C10_DEFINE_TLS_static(std::shared_ptr<ReadyQueue>, tls_local_ready_queue);
 //  2. remembering the "leaf streams" (streams each backward leaf node ran on)
 //  3. during exec_post_processing, for each leaf stream, sync the remembered
 //     current streams (on the leaf stream's device) with that
-//     leaf stream.
+//     leaf stream. If exactly one of the two streams is capturing a CUDA
+//     graph, this sync would cross the capture boundary; it is skipped under
+//     torch.autograd.graph.set_override_stale_capture_stream(True) and is an
+//     error otherwise.
 
 int NodeTask::getReentrantDepth() const {
   std::shared_ptr<GraphTask> graph_task = base_.lock();
@@ -272,8 +276,7 @@ bool ReadyQueue::empty() const {
   return heap_.empty();
 }
 
-Engine::Engine()
-    : max_recursion_depth_(MAX_DEPTH), non_reentrant_device_thread_count_(0) {}
+Engine::Engine() : non_reentrant_device_thread_count_(0) {}
 
 Engine::~Engine() {
   stop();
@@ -399,7 +402,7 @@ void GraphTaskGuard::restore_current_graph_task() {
   current_graph_task = std::move(last_graph_task_);
 }
 
-// The current graph task's exec_info is being used to trim unnecessary edegs
+// The current graph task's exec_info is being used to trim unnecessary edges
 // during node evaluation, see `Node.task_should_compute_output()` function.
 const std::unordered_map<Node*, GraphTask::ExecInfo>*
 get_current_graph_task_exec_info() {
@@ -503,7 +506,7 @@ std::vector<Node*> get_current_graph_task_execution_order() {
 // thread_main is used by:
 // 1). autograd threads for devices (i.e. CUDA, XLA)
 // 2). the caller/owning thread of the backward call on CPU (sync mode)
-// 3). Renetrant backward that invoked by either 1) or 2)
+// 3). Reentrant backward that invoked by either 1) or 2)
 // The exit conditions are different for the above three cases.
 // For 1), we are spinning on running the thread_main on device autograd
 //         threads throughout the Engine lifetime, thread_main will get
@@ -611,7 +614,7 @@ auto Engine::thread_main(const std::shared_ptr<GraphTask>& graph_task) -> void {
   }
 }
 
-// Reentrant call will re-use the graph_task's owner thread ready_queue for
+// Reentrant call will reuse the graph_task's owner thread ready_queue for
 // queueing tasks (NOTE: this is not true in the async_mode of the engine).
 // While we can create separate ready queue for each new reentrant
 // thread, but sharing the same cpu_ready_queue with parent thread is a
@@ -646,7 +649,7 @@ void Engine::reentrant_thread_init() {
 
 void Engine::thread_on_exception(
     const std::shared_ptr<GraphTask>& graph_task,
-    const std::shared_ptr<Node>& fn,
+    const c10::intrusive_ptr<Node>& fn,
     std::exception& e) {
   graph_task->set_exception(std::current_exception(), fn);
 }
@@ -664,7 +667,7 @@ GraphTask::GraphTask(
     bool exit_on_error)
     : keep_graph_(keep_graph),
       graph_roots_(std::move(graph_roots)),
-      owner_(NO_DEVICE),
+
       reentrant_depth_(reentrant_depth),
       exit_on_error_(exit_on_error),
       cpu_ready_queue_(std::move(cpu_ready_queue)),
@@ -707,9 +710,8 @@ void GraphTask::mark_as_completed_and_run_post_processing() {
 }
 
 void GraphTask::exec_post_processing() {
-  if (!not_ready_.empty()) {
-    throw std::runtime_error("could not compute gradients for some functions");
-  }
+  TORCH_CHECK(
+      not_ready_.empty(), "could not compute gradients for some functions");
 
   // set the thread_local current_graph_task_ as more callbacks can be installed
   // by existing final callbacks.
@@ -725,7 +727,9 @@ void GraphTask::exec_post_processing() {
 
   // See Note [Streaming backwards].
   // Syncs caller_current_stream with leaf streams, so final_callbacks may use
-  // any grad on its device's current stream.
+  // any grad on its device's current stream. (Under
+  // set_override_stale_capture_stream(True), syncs that would cross a CUDA
+  // graph capture boundary are skipped; see below.)
   if (!leaf_streams.empty()) {
     for (const auto& leaf_stream : leaf_streams) {
       // stash_current_cuda/privateuse1_streams() stashed streams for all device
@@ -740,6 +744,45 @@ void GraphTask::exec_post_processing() {
 
       if (caller_current_stream.has_value() &&
           caller_current_stream != leaf_stream) {
+        // If exactly one of the two streams is capturing, this sync would
+        // cross the CUDA graph capture boundary and invalidate the capture
+        // (cudaErrorStreamCaptureIsolation). The common case is a leaf that
+        // ran on a stale non-capturing stream during capture: when all of a
+        // leaf's incoming grads are undefined, InputBuffer::add returns
+        // before its stream reconciliation, so the stale-capture-stream
+        // override never reconciles the leaf's stream. Work on a
+        // non-capturing stream is not part of the capture (and captured work
+        // produces no eager-visible results), so this ordering edge is
+        // meaningless in either direction: skip it under the override,
+        // otherwise raise an actionable error instead of the CUDA error.
+        if (caller_current_stream->is_capturing() !=
+            leaf_stream.is_capturing()) {
+          if (at::globalContext().overrideStaleCaptureStream()) {
+            TORCH_WARN_ONCE(
+                "Skipping the end-of-backward sync between a leaf stream and "
+                "the caller's current stream because exactly one of them is "
+                "capturing a CUDA graph (see "
+                "torch.autograd.graph.set_override_stale_capture_stream).");
+            continue;
+          }
+          TORCH_CHECK(
+              false,
+              "During CUDA graph capture, autograd tried to synchronize "
+              "streams across the capture boundary (leaf stream ",
+              leaf_stream.id(),
+              " on device ",
+              static_cast<int>(leaf_stream.device_index()),
+              leaf_stream.is_capturing() ? " is capturing but the caller's "
+                                           "stream is not"
+                                         : " is not capturing but the "
+                                           "caller's stream is",
+              "), which would invalidate the capture. A common cause is an "
+              "autograd leaf from warmup holding a stale stream. Either run "
+              "warmup on the capture stream, delete references to the "
+              "autograd graph (e.g. `del loss`) before capture, call "
+              "backward() with the capturing stream current, or call "
+              "torch.autograd.graph.set_override_stale_capture_stream(True).");
+        }
         auto event = c10::Event{leaf_stream.device_type()};
         event.record(leaf_stream);
         caller_current_stream->wait(event);
@@ -758,9 +801,9 @@ void GraphTask::exec_post_processing() {
     // final_callbacks run on the per-device caller_current_streams (the ambient
     // streams surrounding the user's call to backward()). This has two
     // benefits:
-    //  1. caller_current_streams have been synced with leaf_streams, so
-    //  callbacks may
-    //     safely access any grad.
+    //  1. caller_current_streams have been synced with leaf_streams (except
+    //     for syncs skipped under set_override_stale_capture_stream during
+    //     CUDA graph capture), so callbacks may safely access any grad.
     //  2. The callback's results can safely be used on (user-facing)
     //  caller_current_streams
     //     after backward().
@@ -782,7 +825,8 @@ void GraphTask::exec_post_processing() {
   }
 }
 
-void GraphTask::set_exception_without_signal(const std::shared_ptr<Node>& fn) {
+void GraphTask::set_exception_without_signal(
+    const c10::intrusive_ptr<Node>& fn) {
   if (!has_error_.exchange(true)) {
     if (AnomalyMode::is_enabled() && fn) {
       fn->metadata()->print_stack(fn->name());
@@ -792,7 +836,7 @@ void GraphTask::set_exception_without_signal(const std::shared_ptr<Node>& fn) {
 
 void GraphTask::set_exception(
     std::exception_ptr eptr,
-    const std::shared_ptr<Node>& fn) {
+    const c10::intrusive_ptr<Node>& fn) {
   set_exception_without_signal(fn);
   if (!future_completed_.exchange(true)) {
     future_result_->setError(std::move(eptr));
@@ -924,7 +968,7 @@ static void validate_outputs_impl(
     std::stringstream ss;
     ss << "invalid number of gradients - expected ";
     ss << input_metadata_container.size() << ", but got " << grads.size();
-    TORCH_CHECK(false, format_error(ss.str()));
+    TORCH_CHECK(false, format_error(std::move(ss).str()));
   }
   for (const auto i : c10::irange(grads.size())) {
     if (!has_input_metadata(input_metadata_container[i])) {
@@ -949,15 +993,17 @@ static void validate_outputs_impl(
     TORCH_CHECK(
         isFloatingType(grad.scalar_type()) ||
         (input_is_complex == grad_is_complex));
-    if (c10::typeMetaToScalarType(metadata.options().dtype()) !=
-        grad.scalar_type()) {
-      grad = grad.to(c10::typeMetaToScalarType(metadata.options().dtype()));
-    }
-    if (grad.dtype() != metadata.dtype()) {
-      std::stringstream ss;
-      ss << "invalid gradient at index " << i << " - expected dtype ";
-      ss << metadata.dtype() << " but got " << grad.dtype();
-      TORCH_CHECK(false, format_error(ss.str()));
+
+    if (metadata.grad_dtype().has_value()) {
+      if (grad.scalar_type() != metadata.grad_dtype().value()) {
+        grad = grad.to(metadata.grad_dtype().value());
+      }
+      if (grad.scalar_type() != metadata.grad_dtype().value()) {
+        std::stringstream ss;
+        ss << "invalid gradient at index " << i << " - expected dtype ";
+        ss << metadata.grad_dtype().value() << " but got " << grad.dtype();
+        TORCH_CHECK(false, format_error(std::move(ss).str()));
+      }
     }
     if (grad.layout() != metadata.layout()) {
       // TODO: Currently we only support (*, Sparse) combination for
@@ -974,22 +1020,22 @@ static void validate_outputs_impl(
         std::stringstream ss;
         ss << "invalid gradient at index " << i << " - expected layout ";
         ss << metadata.layout() << " but got " << grad.layout();
-        TORCH_CHECK(false, format_error(ss.str()));
+        TORCH_CHECK(false, format_error(std::move(ss).str()));
       }
     }
 
     if (grad.device() != metadata.device()) {
-      // quick hack for: https://github.com/pytorch/pytorch/issues/65016 but
-      // should be eventually removed
-      if (!(metadata.is_tensor_subclass() ||
-            grad.unsafeGetTensorImpl()->is_python_dispatch())) {
-        if (grad.dim() == 0) {
-          grad = grad.to(metadata.device());
-        } else {
+      if (grad.dim() == 0) {
+        grad = grad.to(metadata.device());
+      } else {
+        // quick hack for: https://github.com/pytorch/pytorch/issues/65016 but
+        // should be eventually removed
+        if (!(metadata.is_tensor_subclass() ||
+              grad.unsafeGetTensorImpl()->is_python_dispatch())) {
           std::stringstream ss;
           ss << "invalid gradient at index " << i << " - expected device ";
           ss << metadata.device() << " but got " << grad.device();
-          TORCH_CHECK(false, format_error(ss.str()));
+          TORCH_CHECK(false, format_error(std::move(ss).str()));
         }
       }
     }
@@ -1053,7 +1099,7 @@ static variable_list call_function(
   validate_outputs(fn.next_edges(), outputs, [&](const std::string& msg) {
     std::ostringstream ss;
     ss << "Function " << fn.name() << " returned an " << msg;
-    return ss.str();
+    return std::move(ss).str();
   });
 
   // NOLINTNEXTLINE(bugprone-use-after-move)
@@ -1065,8 +1111,19 @@ void Engine::evaluate_function(
     Node* func,
     InputBuffer& inputs,
     const std::shared_ptr<ReadyQueue>& cpu_ready_queue) {
-  // Locally set the current stream to func's associated stream
-  auto opt_parent_stream = (*func).stream();
+  // The parent stream was cached on the InputBuffer by InputBuffer::add()
+  // as the consuming node's canonical stream (possibly overridden by the
+  // stale-capture path when a stale non-capturing node stream collides
+  // with a capturing producer). Reading the cached value here keeps the
+  // override decision in one place and avoids re-running the detection
+  // per node visit. For code paths where InputBuffer::add() was never
+  // called with an accelerator input (e.g. CPU-only backward), fall back
+  // to the node's canonical stream. See
+  // InputBuffer::opt_overridden_consumer_stream for the invariant.
+  auto opt_parent_stream = inputs.opt_overridden_consumer_stream.has_value()
+      ? inputs.opt_overridden_consumer_stream
+      : func->stream();
+
   c10::OptionalStreamGuard parent_stream_guard{opt_parent_stream};
 
   // Ensure that the incoming gradients are ready
@@ -1075,19 +1132,16 @@ void Engine::evaluate_function(
       continue;
     }
     const auto device = inputs.buffer[pos].device();
-    // TODO: Use at::accelerator::isAccelerator(device->type()) instead
-    bool is_accelerator =
-        device.is_cuda() || device.is_mtia() || device.is_privateuseone();
+    bool is_accelerator = at::accelerator::isAccelerator(device.type());
     if (!is_accelerator) {
       continue;
     }
-    TORCH_INTERNAL_ASSERT(inputs.ready_events[pos].has_value());
-    TORCH_INTERNAL_ASSERT(inputs.ready_streams[pos].has_value());
-    TORCH_INTERNAL_ASSERT(opt_parent_stream.has_value());
-    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-    if (opt_parent_stream.value() != inputs.ready_streams[pos].value()) {
-      // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-      opt_parent_stream->wait(inputs.ready_events[pos].value());
+    auto& opt_ready_stream = inputs.ready_streams[pos];
+    auto& opt_ready_event = inputs.ready_events[pos];
+    TORCH_INTERNAL_ASSERT(opt_ready_stream && opt_parent_stream);
+    if (*opt_parent_stream != *opt_ready_stream) {
+      TORCH_INTERNAL_ASSERT(opt_ready_event);
+      opt_parent_stream->wait(opt_ready_event.value());
     }
   }
 
@@ -1106,7 +1160,6 @@ void Engine::evaluate_function(
           *func, InputBuffer::variables(std::move(inputs)));
     }
     if (auto* capture_vec = fn_info.captures_.get()) {
-      auto opt_parent_stream = (*func).stream();
       // Lock mutex for writing to graph_task->captured_vars_.
       std::lock_guard<std::mutex> lock(graph_task->mutex_);
       for (const auto& capture : *capture_vec) {
@@ -1152,12 +1205,13 @@ void Engine::evaluate_function(
     for (const auto i : c10::irange(num_outputs)) {
       auto& output = outputs[i];
       at::OptionalDeviceGuard guard(device_of(output));
-      if (output.defined() && isnan(output)._is_any_true().item<bool>()) {
-        std::stringstream ss;
-        ss << "Function '" << fn.name() << "' returned nan values in its " << i
-           << "th output.";
-        throw std::runtime_error(ss.str());
-      }
+      TORCH_CHECK(
+          !output.defined() || !isnan(output)._is_any_true().item<bool>(),
+          "Function '",
+          fn.name(),
+          "' returned nan values in its ",
+          i,
+          "th output.");
     }
   }
 
@@ -1178,7 +1232,7 @@ void Engine::evaluate_function(
 
     if (it == dependencies.end()) {
       auto name = next.function->name();
-      throw std::runtime_error(std::string("dependency not found for ") + name);
+      TORCH_CHECK(false, "dependency not found for ", name);
     } else if (--it->second == 0) {
       dependencies.erase(it);
       is_ready = true;
@@ -1197,10 +1251,12 @@ void Engine::evaluate_function(
       // No buffers have been allocated for the function
       InputBuffer input_buffer(next.function->num_inputs());
 
-      // Accumulates into buffer
-      auto opt_next_stream = next.function->stream();
       input_buffer.add(
-          next.input_nr, std::move(output), opt_parent_stream, opt_next_stream);
+          next.input_nr,
+          std::move(output),
+          opt_parent_stream,
+          next.function->stream(),
+          next.function.get());
 
       if (is_ready) {
         auto queue = ready_queue(cpu_ready_queue, next.function->device());
@@ -1213,10 +1269,12 @@ void Engine::evaluate_function(
       // The function already has a buffer
       auto& input_buffer = not_ready_it->second;
 
-      // Accumulates into buffer
-      auto opt_next_stream = next.function->stream();
       input_buffer.add(
-          next.input_nr, std::move(output), opt_parent_stream, opt_next_stream);
+          next.input_nr,
+          std::move(output),
+          opt_parent_stream,
+          next.function->stream(),
+          next.function.get());
       if (is_ready) {
         auto queue = ready_queue(cpu_ready_queue, next.function->device());
         queue->push(
@@ -1228,7 +1286,7 @@ void Engine::evaluate_function(
 }
 
 static uint64_t compute_min_topological_nr(const edge_list& outputs) {
-  // Computes the mininum topological number among all the outputs
+  // Computes the minimum topological number among all the outputs
   if (outputs.empty()) {
     return 0;
   }
@@ -1299,15 +1357,13 @@ auto Engine::execute(
         "your parameters to None after use to break the cycle and avoid the leak.");
   }
 
-  // Allows us to assert no other threads are in backwards
-  CompiledAutogradThreadingDebugCheck _thread_check;
   auto compiled_autograd = the_compiled_autograd.load();
   TORCH_INTERNAL_ASSERT(compiled_autograd != COMPILED_AUTOGRAD_POISON);
 
   // accumulate_grad is true if and only if the frontend call was to
   // backward(), not grad(). grad() returns the sum of the gradients
   // w.r.t. the inputs and thus needs the inputs to be present.
-  TORCH_CHECK_VALUE(
+  TORCH_INTERNAL_ASSERT(
       accumulate_grad || !outputs.empty(), "grad requires non-empty inputs.");
 
   // A fresh first time Engine::execute call should start on the CPU device,
@@ -1333,9 +1389,12 @@ auto Engine::execute(
 
   // If we receive a single root, skip creating extra root node
   bool skip_dummy_node = root_edges.size() == 1 && compiled_autograd == nullptr;
-  auto graph_root = skip_dummy_node
-      ? root_edges.at(0).function
-      : std::make_shared<GraphRoot>(root_edges, inputs);
+  c10::intrusive_ptr<Node> graph_root;
+  if (skip_dummy_node) {
+    graph_root = root_edges.at(0).function;
+  } else {
+    graph_root = c10::make_intrusive<GraphRoot>(root_edges, inputs);
+  }
 
   auto min_topo_nr = compute_min_topological_nr(outputs);
   // Now compute the dependencies for all executable functions
@@ -1347,6 +1406,11 @@ auto Engine::execute(
   }
 
   if (compiled_autograd != nullptr) {
+    TORCH_CHECK_NOT_IMPLEMENTED(
+        num_threads_in_compiled_autograd.load() == 0,
+        "Re-entrant into Compiled Autograd from a parent Compiled Autograd call is not yet supported. Consider disabling Compiled Autograd on the re-entrant call.");
+    // Allows us to assert no other threads are in backwards
+    CompiledAutogradThreadingDebugCheck _thread_check;
     // see [Note: Compiled Autograd]
     _thread_check.release();
     GraphTaskGuard guard(graph_task);
@@ -1366,7 +1430,8 @@ auto Engine::execute(
         root_edges.at(0).input_nr,
         std::move(input),
         input_stream,
-        opt_next_stream);
+        opt_next_stream,
+        root_edges.at(0).function.get());
 
     execute_with_graph_task(
         graph_task, std::move(graph_root), std::move(input_buffer));
@@ -1397,7 +1462,7 @@ void Engine::initialize_device_threads_pool() {
 
 c10::intrusive_ptr<at::ivalue::Future> Engine::execute_with_graph_task(
     const std::shared_ptr<GraphTask>& graph_task,
-    std::shared_ptr<Node> graph_root,
+    c10::intrusive_ptr<Node> graph_root,
     InputBuffer&& input_buffer) {
   initialize_device_threads_pool();
   // Lock mutex for GraphTask.
@@ -1495,8 +1560,8 @@ void Engine::set_compiled_autograd(Engine::compiled_autograd_fn fn) {
   }
   auto prior = the_compiled_autograd.exchange(COMPILED_AUTOGRAD_POISON);
   TORCH_CHECK(
-      num_threads_in_backwards.load() == 0 && prior != COMPILED_AUTOGRAD_POISON,
-      "compiled_autograd._enable() requires no threads in backwards()");
+      prior != COMPILED_AUTOGRAD_POISON,
+      "compiled_autograd._enable() does not support multiple Python threads");
   the_compiled_autograd.store(fn);
 }
 

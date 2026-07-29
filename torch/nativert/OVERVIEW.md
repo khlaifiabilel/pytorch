@@ -5,11 +5,11 @@ high-performance CPU inference on the PT2 stack, it's designed to be a drop-in
 replacement for
 [Static Runtime](https://github.com/pytorch/pytorch/blob/main/torch/csrc/jit/runtime/static/README.md).
 
-However, it's support doesn't end there; by default it integrates with the torch
-dispatcher, inheriting it's backend
+However, its support doesn't end there; by default it integrates with the torch
+dispatcher, inheriting its backend
 [support matrix](https://docs.pytorch.org/docs/stable/backends.html). Moreover,
 it supports the execution of
-[AOTInductor](https://github.com/pytorch/pytorch/blob/main/docs/source/torch.compiler_aot_inductor.rst)-lowered
+[AOTInductor](https://docs.pytorch.org/docs/main/torch.compiler_aot_inductor.html)-lowered
 artifacts, and can be extended to support other delegate backends as seen fit.
 
 This document is intended to provide an overview of the foundational NativeRT
@@ -120,7 +120,7 @@ output values.
 
 ### Value
 
-Values are a internal construct that represent the edges of our graph. In the
+Values are an internal construct that represent the edges of our graph. In the
 graph, a value could only carry one of these permissible types: Tensor,
 TensorList, SymInt, SymIntList and CustomObj. Values are uniquely identifiable
 by an integer. Values also have a string name for logging purposes, but we don’t
@@ -160,7 +160,7 @@ Weights is a class that manages the static states of a model, which remains
 immutable throughout the execution. For example module parameters, buffers, and
 constants are all managed in Weights. These tensors are "read-only constants" in
 a single inference run(). As such, they can be shared across all threads.
-Weights is also an user-facing class that provides some APIs for advanced weight
+Weights is also a user-facing class that provides some APIs for advanced weight
 management, such as customized weight loading, weight swapping, and/or in-place
 updates.
 
@@ -244,12 +244,12 @@ For CPU kernels, it is extremely inefficient to go through the dispatcher. For
 one, the dispatcher doesn't deal with kernel out-variants.
 
 > **_NOTE:_** an out-variant of a kernel is one that takes the outputs as
-> mutable references. this has a few benefits... namely, it allows us to re-use
+> mutable references. this has a few benefits... namely, it allows us to reuse
 > the storage/manage from the previous execution.
 
 In addition, the dispatcher acts as a stack machine. You push the inputs to the
 stack, run the op on the specified device, and then pop the outputs. This in
-itself is much more inefficient then accessing the values directly without
+itself is much more inefficient than accessing the values directly without
 having to play musical chairs.
 
 Registering statically-dispatched cpu kernels is pretty easy. Here is an example
@@ -281,8 +281,8 @@ RuntimeConfigs {
 ### Constant Folding
 
 Constant folding is the process of finding all of the constant-evaluable
-subgraphs, evaluating them at startup, and then storing thier results as
-constants as opposed to re-evaluting them every time.
+subgraphs, evaluating them at startup, and then storing their results as
+constants as opposed to re-evaluating them every time.
 
 To enable constant folding, you can set the following configurations.
 
@@ -311,7 +311,7 @@ torch.ops.quantized.linear_dynamic_fp16.default
 which should give a ~2x speedup over the fp32 variant with minimal effect on
 correctness.
 
-The linear_prepack_fp16 op will be constant-folded, so it's imperitive that
+The linear_prepack_fp16 op will be constant-folded, so it's imperative that
 these two features are used together.
 
 To enable this feature, use the following configurations.
@@ -327,7 +327,7 @@ RuntimeConfigs {
 
 > :warning: **This is an experimental feature**
 
-The main upside of memory planning comes from the efficient re-use of tensor
+The main upside of memory planning comes from the efficient reuse of tensor
 buffers, which is extremely important in memory-bound services. That is, if two
 tensors don’t have an overlapping lifetime during execution, and the first
 tensor is larger than the second, then the second tensor can share the same
@@ -363,7 +363,7 @@ additions to enable memory planning.
 │    owned buffer offsets                    │ │ │ │   Frame_1    │  │                                                │   │executor.execute(args, frame)    │ │ │ │
 │                                            │ │ │ ├──────────────┤  │                                                │   │...                              │ │ │ │
 │    3. telling the layout planner           │ │ │ │   Frame_N    │◀─┼────return_frame()────────────5─────────────────┴───│frame.layout_manager.deallocate()│ │ │ │
-│    when a tensor have outgrown             │ │ │ └──────────────┘  │                                   ┌───────4────────┴─────────────────────────────────┘ │ │ │
+│    when a tensor has outgrown              │ │ │ └──────────────┘  │                                   ┌───────4────────┴─────────────────────────────────┘ │ │ │
 │                                            │ │ └───────────────────┘                                   │                                                    │ │ │
 │                                            │ │ ┌───────────────────┐                                   │                                                    │ │ │
 │                                            │ │ │                   │                                   │                                                    │ │ │

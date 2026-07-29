@@ -1,6 +1,6 @@
 // Original TunableOp is from onnxruntime.
 // https://github.com/microsoft/onnxruntime/blob/main/onnxruntime/core/framework/tunable.h
-// https://github.com/microsoft/onnxruntime/tree/main/onnxruntime/core/providers/rocm/tunable
+// https://github.com/microsoft/onnxruntime/tree/main/onnxruntime/core/providers/cuda/tunable
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 //
@@ -103,10 +103,25 @@ class TORCH_CUDA_CPP_API TuningResultsManager {
 
     void RecordUntuned( std::ofstream& untuned_file, const std::string& op_signature,
       const std::string& params_signature, const std::string& blas_signature);
+    void ClearUntuned();
+
+    void InitRealtimeAppend(
+        const std::string& filename,
+        const std::unordered_map<std::string, std::string>& validators);
+
+    void AppendResultLine(const std::string& op_sig,
+                         const std::string& param_sig,
+                         const ResultEntry& result);
+
+    void CloseRealtimeAppend();  // For clean shutdown
   private:
     std::mutex lock_;
+    std::mutex realtime_file_mutex_;
+    std::unique_ptr<std::ofstream> realtime_out_;
+    std::string realtime_filename_;
     ResultsMap results_;
     UntunedMap untuned_results_;
+    bool validators_written_ = false;
 
 };
 
@@ -134,6 +149,16 @@ class TORCH_CUDA_CPP_API TuningResultsValidator {
     GetValidateFuncs validators_;
 };
 
+struct NumericalCheckConfig {
+  bool   enabled{false};
+  double atol{1e-5};
+  double rtol{1e-5};
+
+  NumericalCheckConfig() = default;
+  NumericalCheckConfig(bool e, double a, double r) : enabled(e), atol(a), rtol(r) {}
+};
+
+
 class TORCH_CUDA_CPP_API TuningContext {
   public:
     TuningContext();
@@ -155,12 +180,17 @@ class TORCH_CUDA_CPP_API TuningContext {
 
     void EnableNumericsCheck(bool value);
     bool IsNumericsCheckEnabled() const;
+    void SetNumericalCheckConfig(bool enabled, double atol, double rtol);
+    NumericalCheckConfig GetNumericalCheckConfig() const;
 
     void SetMaxTuningDurationMs(int max_duration_ms);
     int GetMaxTuningDurationMs() const;
 
     void SetMaxTuningIterations(int max_iter);
     int GetMaxTuningIterations() const;
+
+    void SetCublasLtRequestedAlgoCount(int count);
+    int GetCublasLtRequestedAlgoCount() const;
 
     void SetMaxWarmupDurationMs(int max_duration_ms);
     int GetMaxWarmupDurationMs() const;
@@ -185,10 +215,7 @@ class TORCH_CUDA_CPP_API TuningContext {
     void SetFilename(const std::string& filename, bool insert_device_ordinal=false);
     std::string GetFilename() const;
 
-    void WriteFileOnExit(bool value);
-
     bool ReadFile(const std::string& filename={});
-    bool WriteFile(const std::string& filename={});
 
     template<class... Types>
     void Log(int level, Types... args) {
@@ -207,10 +234,10 @@ class TORCH_CUDA_CPP_API TuningContext {
     bool tuning_enable_;
     bool record_untuned_enable_;
     bool manager_initialized_;
-    bool write_file_on_exit_;
     bool numerics_check_enable_;
     int max_tuning_duration_ms_;
     int max_tuning_iterations_;
+    int cublaslt_requested_algo_count_;
     int max_warmup_duration_ms_;
     int max_warmup_iterations_;
     bool icache_flush_;
@@ -222,6 +249,8 @@ class TORCH_CUDA_CPP_API TuningContext {
     std::ofstream untuned_file_;
     size_t results_count_from_input_file_;
     bool is_shutting_down_;
+
+    NumericalCheckConfig numerics_cfg_;
 };
 
 TORCH_CUDA_CPP_API TuningContext* getTuningContext();

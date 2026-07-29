@@ -25,6 +25,9 @@ template<> inline cudaDataType getCudaDataType<double>() {
 template<> inline cudaDataType getCudaDataType<c10::complex<c10::Half>>() {
   return CUDA_C_16F;
 }
+template<> inline cudaDataType getCudaDataType<c10::complex<c10::BFloat16>>() {
+  return CUDA_C_16BF;
+}
 template<> inline cudaDataType getCudaDataType<c10::complex<float>>() {
   return CUDA_C_32F;
 }
@@ -90,7 +93,7 @@ inline cudaDataType ScalarTypeToCudaDataType(const c10::ScalarType& scalar_type)
     case c10::ScalarType::Float8_e5m2fnuz:
       return HIP_R_8F_E5M2_FNUZ;
 #endif
-#if (defined(CUDA_VERSION) && CUDA_VERSION >= 12080)
+#if (defined(CUDA_VERSION) && CUDA_VERSION >= 12080) || (defined(USE_ROCM) && ROCM_VERSION >= 70000)
     case c10::ScalarType::Float4_e2m1fn_x2:
       return CUDA_R_4F_E2M1;
 #endif

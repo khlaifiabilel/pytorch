@@ -366,7 +366,7 @@ at::Tensor PackedLinearWeightsQnnp::apply_dynamic_impl(
       w_zero_points.data(),
       /* for dynamic should really be called dequant scale */
       requantization_scales.data(),
-      (uint8_t*)q_input.data_ptr<c10::quint8>(),
+      reinterpret_cast<const uint8_t*>(q_input.const_data_ptr<c10::quint8>()),
       cols_input /* input_stride */,
       packB->getPackedWeights(),
       bias_ptr,
@@ -414,7 +414,6 @@ at::Tensor& PackedLinearWeightFp16::apply_dynamic_impl(
   TORCH_CHECK(input.size(input.dim() - 1) == packed_weight_fp16.numRows())
   TORCH_CHECK(input.dim() >= 2);
 
-  // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
   const int64_t M = size_to_dim_(input.dim() - 1, input.sizes());
   const int64_t N = packed_weight_fp16.numCols();
   std::vector<int64_t> output_sizes = input.sizes().vec();
@@ -444,7 +443,27 @@ at::Tensor& PackedLinearWeightFp16::apply_dynamic_impl(
   // Add bias term
   if (bias_.has_value()) {
     TORCH_CHECK(bias_->dim() == 1);
-    output.add_(*bias_);
+    const auto& bias = *bias_;
+    // Fast path for a contiguous float32 bias vector of length N: add it
+    // directly over the row-major output. Otherwise fall back to add_, which
+    // handles dtype promotion and size-1 broadcasting.
+    if (bias.scalar_type() == at::kFloat && bias.numel() == N &&
+        bias.is_contiguous()) {
+      const float* bias_data = bias.const_data_ptr<float>();
+      constexpr int64_t kGrainElems = 32768;
+      const int64_t grain_size =
+          std::max<int64_t>(1, kGrainElems / std::max<int64_t>(1, N));
+      at::parallel_for(0, M, grain_size, [&](int64_t begin, int64_t end) {
+        for (const auto row : c10::irange(begin, end)) {
+          float* out_row = output_data + row * N;
+          for (const auto col : c10::irange(N)) {
+            out_row[col] += bias_data[col];
+          }
+        }
+      });
+    } else {
+      output.add_(bias);
+    }
   }
 
   return output;
@@ -516,7 +535,7 @@ at::Tensor PackedLinearWeightsOnednn::apply_dynamic_impl(
 #ifdef USE_FBGEMM
   // Use FBGEMM's FindMinMax if available since it's faster
   fbgemm::FindMinMax(
-      /*m=*/input_contig.data_ptr<float>(),
+      /*m=*/input_contig.const_data_ptr<float>(),
       /*min=*/&x_min,
       /*max=*/&x_max,
       /*len=*/input.numel());
@@ -545,7 +564,7 @@ at::Tensor PackedLinearWeightsOnednn::apply_dynamic_impl(
       /*reduce_range=*/reduce_range);
   const std::vector<int32_t>& src_zero_point = std::vector<int32_t>(1, q_params.zero_point);
   // weights, dst
-  auto w = *(weight_.get());
+  auto w = *weight_;
   auto dst_dims = {x.get_dim(0), w.get_dim(1)};
   const ideep::scale_t& src_scales = ideep::scale_t(1, 1.0/q_params.scale);
   const ideep::scale_t& weights_scales = w.get_scale();
@@ -742,7 +761,7 @@ at::Tensor PackedLinearWeightsACL::apply_dynamic_impl(
 #ifdef USE_FBGEMM
     // Use FBGEMM's FindMinMax if available since it's faster
     fbgemm::FindMinMax(
-        /*m=*/input_contig.data_ptr<float>(),
+        /*m=*/input_contig.const_data_ptr<float>(),
         /*min=*/&x_min,
         /*max=*/&x_max,
         /*len=*/input.numel());
@@ -888,7 +907,7 @@ class QLinearUnpackedDynamicFp16 final {
   static at::Tensor run(
       at::Tensor input,
       const at::Tensor& weight,
-      const at::Tensor& bias) {
+      const std::optional<at::Tensor>& bias) {
     // We make a strong guarantee that models using these operators will have
     // the same numerics across different machines. Therefore, we do not provide
     // a fallback path and rather fail loudly if we cannot run FBGEMM.
@@ -908,7 +927,7 @@ class QLinearUnpackedDynamicFp16 final {
   static at::Tensor meta(
       at::Tensor input,
       const at::Tensor& weight,
-      const at::Tensor& bias) {
+      const std::optional<at::Tensor>& bias) {
     // We make a strong guarantee that models using these operators will have
     // the same numerics across different machines. Therefore, we do not provide
     // a fallback path and rather fail loudly if we cannot run FBGEMM.
@@ -921,7 +940,7 @@ class QLinearUnpackedDynamicFp16 final {
 
     auto out_channel = weight.sym_sizes().vec()[0];
     auto out_sizes = input.sym_sizes().vec();
-    out_sizes[out_sizes.size() - 1] = out_channel;
+    out_sizes[out_sizes.size() - 1] = std::move(out_channel);
 
     return at::empty_symint(out_sizes, input.options());
   }
@@ -929,7 +948,7 @@ class QLinearUnpackedDynamicFp16 final {
   static at::Tensor run(
       at::Tensor /* input */,
       const at::Tensor& weight,
-      const at::Tensor& bias) {
+      const std::optional<at::Tensor>& bias) {
     // We make a strong guarantee that models using these operators will have
     // the same numerics across different machines. Therefore, we do not provide
     // a fallback path and rather fail loudly if we cannot run FBGEMM.
@@ -940,7 +959,7 @@ class QLinearUnpackedDynamicFp16 final {
   static at::Tensor meta(
       at::Tensor /* input */,
       const at::Tensor& weight,
-      const at::Tensor& bias) {
+      const std::optional<at::Tensor>& bias) {
     TORCH_CHECK(
         false, "This PyTorch installation was not built with FBGEMM operators");
   }

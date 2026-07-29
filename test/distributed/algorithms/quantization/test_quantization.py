@@ -23,7 +23,23 @@ from torch.testing._internal.common_utils import (
 )
 
 
-torch.backends.cuda.matmul.allow_tf32 = False
+_PRIOR_FP32_PRECISION: str | None = None
+
+
+def setUpModule():
+    global _PRIOR_FP32_PRECISION
+    # Snapshot fp32_precision (not allow_tf32) so tearDownModule restores the
+    # exact original; writing allow_tf32 back can't reproduce the "none" default.
+    _PRIOR_FP32_PRECISION = torch.backends.cuda.matmul.fp32_precision
+    torch.backends.cuda.matmul.allow_tf32 = False
+
+
+def tearDownModule():
+    global _PRIOR_FP32_PRECISION
+    if _PRIOR_FP32_PRECISION is not None:
+        torch.backends.cuda.matmul.fp32_precision = _PRIOR_FP32_PRECISION
+        _PRIOR_FP32_PRECISION = None
+
 
 if not dist.is_available():
     print("Distributed not available, skipping tests", file=sys.stderr)
@@ -79,7 +95,7 @@ if BACKEND == "gloo" or BACKEND == "nccl":
             dist.init_process_group(
                 store=store, rank=self.rank, world_size=self.world_size, backend="gloo"
             )
-            group = list(range(0, self.world_size))
+            group = list(range(self.world_size))
             group_id = dist.group.WORLD
             self._test_all_gather(
                 group, group_id, self.rank, dtype=torch.float32, qtype=DQuantType.FP16
@@ -94,7 +110,7 @@ if BACKEND == "gloo" or BACKEND == "nccl":
             dist.init_process_group(
                 store=store, rank=self.rank, world_size=self.world_size, backend="gloo"
             )
-            group = list(range(0, self.world_size))
+            group = list(range(self.world_size))
             group_id = dist.group.WORLD
             self._test_all_gather(
                 group, group_id, self.rank, dtype=torch.float32, qtype=DQuantType.BFP16
@@ -111,7 +127,7 @@ if BACKEND == "gloo" or BACKEND == "nccl":
             dist.init_process_group(
                 store=store, rank=self.rank, world_size=self.world_size, backend="nccl"
             )
-            group = list(range(0, self.world_size))
+            group = list(range(self.world_size))
             group_id = dist.new_group(range(self.world_size))
             rank_to_GPU = init_multigpu_helper(self.world_size, BACKEND)
             self._test_all_to_all(
@@ -135,7 +151,7 @@ if BACKEND == "gloo" or BACKEND == "nccl":
             dist.init_process_group(
                 store=store, rank=self.rank, world_size=self.world_size, backend="nccl"
             )
-            group = list(range(0, self.world_size))
+            group = list(range(self.world_size))
             group_id = dist.new_group(range(self.world_size))
             rank_to_GPU = init_multigpu_helper(self.world_size, BACKEND)
             self._test_all_to_all(
@@ -158,7 +174,7 @@ if BACKEND == "gloo" or BACKEND == "nccl":
             dist.init_process_group(
                 store=store, rank=self.rank, world_size=self.world_size, backend="nccl"
             )
-            group = list(range(0, self.world_size))
+            group = list(range(self.world_size))
             group_id = dist.new_group(range(self.world_size))
             rank_to_GPU = init_multigpu_helper(self.world_size, BACKEND)
             self._test_all_to_all_single(
@@ -181,7 +197,7 @@ if BACKEND == "gloo" or BACKEND == "nccl":
             dist.init_process_group(
                 store=store, rank=self.rank, world_size=self.world_size, backend="nccl"
             )
-            group = list(range(0, self.world_size))
+            group = list(range(self.world_size))
             group_id = dist.new_group(range(self.world_size))
             rank_to_GPU = init_multigpu_helper(self.world_size, BACKEND)
             self._test_all_to_all_single(

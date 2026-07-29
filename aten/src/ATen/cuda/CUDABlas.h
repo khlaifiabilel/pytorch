@@ -14,6 +14,7 @@
  */
 
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/BlasBackend.h>
 #include <ATen/OpMathType.h>
 
 namespace at::cuda::blas {
@@ -114,7 +115,6 @@ bool gemm_and_bias(
     int64_t n,
     int64_t k,
     at::opmath_type<Dtype> alpha_val,
-    at::opmath_type<Dtype> beta_val,
     const Dtype* mat1_ptr,
     int64_t mat1_ld,
     const Dtype* mat2_ptr,
@@ -122,8 +122,7 @@ bool gemm_and_bias(
     const Dtype* bias,
     C_Dtype* result_ptr,
     int64_t result_ld,
-    GEMMAndBiasActivationEpilogue activation = GEMMAndBiasActivationEpilogue::None,
-    bool bias2d = false);
+    GEMMAndBiasActivationEpilogue activation = GEMMAndBiasActivationEpilogue::None);
 
 void int8_gemm(
     bool transpose_mat1,
@@ -149,11 +148,13 @@ void scaled_gemm(
     int64_t mat1_ld,
     ScalarType mat1_dtype,
     ScalarType mat1_scale_dtype,
+    at::blas::ScalingType mat1_scaling_type,
     const void* mat2_ptr,
     const void* mat2_scale_ptr,
     int64_t mat2_ld,
     ScalarType mat2_dtype,
     ScalarType mat2_scale_dtype,
+    at::blas::ScalingType mat2_scaling_type,
     const void* bias_ptr,
     ScalarType bias_dtype,
     void* result_ptr,
@@ -161,7 +162,33 @@ void scaled_gemm(
     int64_t result_ld,
     ScalarType result_dtype,
     bool use_fast_accum,
-    bool use_rowwise);
+    const std::optional<Tensor>& alpha);
+
+void grouped_gemm(
+      char transa,
+      char transb,
+      const void* mArrayDev,
+      int64_t avgM,
+      const void* nArrayDev,
+      int64_t avgN,
+      const void* kArrayDev,
+      int64_t avgK,
+      const int64_t* alphaArrayDev,
+      const float* alphaScalar,
+      ScalarType input_dtype,
+      const int64_t* APtrArrayDev,
+      const void* ldaArrayDev,
+      const int64_t* BPtrArrayDev,
+      const void* ldbArrayDev,
+      const int64_t* betaArrayDev,
+      const float* betaScalar,
+      ScalarType result_dtype,
+      const int64_t* CPtrArrayDev,
+      const void* ldcArrayDev,
+      int64_t* DPtrArrayDev,
+      const void* lddArrayDev,
+      int batchCount,
+      bool use_int64_dims);
 
 #define CUDABLAS_BGEMM_ARGTYPES(Dtype)  CUDABLAS_BGEMM_ARGTYPES_AND_C_DTYPE(Dtype, Dtype)
 
@@ -335,9 +362,6 @@ void vdot<c10::complex<double>>(CUDABLAS_DOT_ARGTYPES(c10::complex<double>));
   int m, int n, int nrhs, Dtype** dA_array, int ldda, \
   Dtype** dC_array, int lddc, int* info, int *devInfoArray, int batchSize
 
-// HIP on Windows does not support getrs, geqrf, getrf, gels
-#if !(defined(USE_ROCM) && defined(_MSC_VER))
-
 template<class Dtype>
 void getrsBatched(CUDABLAS_GETRS_ARGTYPES(Dtype)) {
   static_assert(false&&sizeof(Dtype),"at::cuda::blas::getrsBatched: not implemented");
@@ -391,29 +415,5 @@ template<>
 TORCH_CUDA_CU_API void gelsBatched<c10::complex<double>>(CUDABLAS_GELS_BATCHED_ARGTYPES(c10::complex<double>));
 template<>
 TORCH_CUDA_CU_API void gelsBatched<c10::complex<float>>(CUDABLAS_GELS_BATCHED_ARGTYPES(c10::complex<float>));
-
-#else // !(defined(USE_ROCM) && defined(_MSC_VER))
-
-template<class Dtype>
-void getrsBatched(CUDABLAS_GETRS_ARGTYPES(Dtype)) {
-  TORCH_CHECK(false, "at::cuda::blas::getrsBatched: not supported for HIP on Windows");
-}
-
-template <class Dtype>
-void geqrfBatched(CUDABLAS_GEQRF_BATCHED_ARGTYPES(Dtype)) {
-  TORCH_CHECK(false, "at::cuda::blas::geqrfBatched: not supported for HIP on Windows");
-}
-
-template<class Dtype>
-void getrfBatched(CUDABLAS_GETRF_ARGTYPES(Dtype)) {
-  TORCH_CHECK(false, "at::cuda::blas::getrfBatched: not supported for HIP on Windows");
-}
-
-template <class Dtype>
-void gelsBatched(CUDABLAS_GELS_BATCHED_ARGTYPES(Dtype)) {
-  TORCH_CHECK(false, "at::cuda::blas::gelsBatched: not supported for HIP on Windows");
-}
-
-#endif // !(defined(USE_ROCM) && defined(_MSC_VER))
 
 } // namespace at::cuda::blas

@@ -1,3 +1,4 @@
+#include <c10/util/Exception.h>
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/Dispatch.h>
 #include <ATen/Parallel.h>
@@ -14,8 +15,10 @@
 #include <c10/util/Half.h>
 
 #ifdef USE_FBGEMM
+C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wextra-semi")
 #include <fbgemm/Fbgemm.h>
 #include <fbgemm/FbgemmConvert.h>
+C10_DIAGNOSTIC_POP()
 #else
 #include <caffe2/perfkernels/embedding_lookup_idx.h>
 #endif
@@ -106,7 +109,7 @@ bool is_fast_path(const Tensor& src, const std::optional<Tensor>& scale, Tensor&
 // index_add (using add_indices as the index), without creating an intermediary
 // tensor to hold the selected embeddings
 template <typename data_t, typename index_t>
-static std::enable_if_t<std::is_same_v<data_t, double>, void>
+std::enable_if_t<std::is_same_v<data_t, double>, void>
 index_select_add(
     const Tensor& select_indices,
     const Tensor& add_indices,
@@ -492,7 +495,7 @@ index_select_add(const Tensor &select_indices,
 // mul (scaling by per_sample_weights)
 // index_add (using add_indices as the index)
 template <typename data_t, typename index_t>
-static std::enable_if_t<std::is_same_v<data_t, double>, void>
+std::enable_if_t<std::is_same_v<data_t, double>, void>
 index_select_scale_add(
     const Tensor& select_indices,
     const Tensor& add_indices,
@@ -1151,7 +1154,9 @@ void _embedding_bag_cpu_impl_out(Tensor& output, Tensor& offset2bag,
     if (max_indices) {
       max_indices->copy_(bag_size);
     }
-  } else { // EmbeddingBagMode::MAX
+  } else {
+    TORCH_CHECK(mode == EmbeddingBagMode::MAX, "`mode` must be sum, mean, or max.")
+
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
         at::ScalarType::BFloat16,
@@ -1565,7 +1570,7 @@ static void _embedding_bag_dense_backward_cpu_sum_mean(
               scale = per_sample_weights_data[*per_sample_weights_stride * j];
             }
             if (scale_grad_by_freq) {
-              scale /= counts[indices_data[i]];
+              scale /= counts[index];
             }
             if (mode == EmbeddingBagMode::MEAN) {
               auto bag_size = bag_size_data[source];

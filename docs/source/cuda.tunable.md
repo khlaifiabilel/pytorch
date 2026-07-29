@@ -53,6 +53,14 @@
 ```
 
 ```{eval-rst}
+.. autofunction:: set_cublaslt_requested_algo_count
+```
+
+```{eval-rst}
+.. autofunction:: get_cublaslt_requested_algo_count
+```
+
+```{eval-rst}
 .. autofunction:: set_filename
 ```
 
@@ -66,14 +74,6 @@
 
 ```{eval-rst}
 .. autofunction:: get_validators
-```
-
-```{eval-rst}
-.. autofunction:: write_file_on_exit
-```
-
-```{eval-rst}
-.. autofunction:: write_file
 ```
 
 ```{eval-rst}
@@ -94,4 +94,8 @@
 
 ```{eval-rst}
 .. autofunction:: get_rotating_buffer_size
+```
+
+```{eval-rst}
+.. autofunction:: set_numerical_check_tolerances
 ```

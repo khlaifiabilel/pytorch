@@ -38,6 +38,10 @@ TORCH_META_FUNC(fractional_max_pool2d) (
   int64_t poolSizeH = pool_size[0];
   int64_t poolSizeW = pool_size[1];
 
+  TORCH_CHECK(poolSizeH > 0 && poolSizeW > 0,
+    "fractional_max_pool2d(): kernel size should be greater than zero, but got ",
+    poolSizeH, "x", poolSizeW);
+
   int64_t ndims = input.ndimension();
   TORCH_CHECK(ndims == 3 || ndims == 4,
               "fractional_max_pool2d(): Expected 3D or 4D tensor, but got: ", input.sizes());
@@ -130,7 +134,7 @@ namespace native {
 namespace {
 
 template <typename scalar_t>
-static void fractional_max_pool2d_out_single_batch_frame(
+void fractional_max_pool2d_out_single_batch_frame(
   const scalar_t* input,
   scalar_t* output,
   int64_t* indices,
@@ -188,7 +192,7 @@ static void fractional_max_pool2d_out_single_batch_frame(
 }
 
 template <typename scalar_t>
-static void fractional_max_pool2d_out_frame(
+void fractional_max_pool2d_out_frame(
   const scalar_t* input,
   scalar_t* output,
   int64_t* indices,
@@ -220,7 +224,7 @@ static void fractional_max_pool2d_out_frame(
   }
 
 template <typename scalar_t>
-static void fractional_max_pool2d_backward_out_single_batch_frame(
+void fractional_max_pool2d_backward_out_single_batch_frame(
   scalar_t* gradInput,
   const scalar_t* gradOutput,
   const int64_t* indices,
@@ -247,7 +251,7 @@ static void fractional_max_pool2d_backward_out_single_batch_frame(
 }
 
 template <typename scalar_t>
-static void fractional_max_pool2d_backward_out_frame(
+void fractional_max_pool2d_backward_out_frame(
   scalar_t* gradInput,
   const scalar_t* gradOutput,
   const int64_t* indices,

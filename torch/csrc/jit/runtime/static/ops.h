@@ -22,7 +22,7 @@ namespace torch::jit {
 
 using SROpFunctor = SROperator (*)(Node* n);
 struct SROperatorFunctor {
-  virtual SROperator Generate(Node*) {
+  virtual SROperator Generate(Node* /*unused*/) {
     SROperator out;
     return out;
   }
@@ -158,14 +158,14 @@ bool hasVarArgs(Node* n);
 inline std::string PrintNode(const Node* node) {
   std::ostringstream ss;
   node->print(ss, 0, nullptr, false);
-  return ss.str();
+  return std::move(ss).str();
 }
 
 inline void LogAndDumpSchema(const Node* node) {
   VLOG(1) << "Found schema mismatch for: " << node->schema();
 }
 
-inline bool sr_schema_check(torch::jit::Node*) {
+inline bool sr_schema_check(torch::jit::Node* /*unused*/) {
   return true;
 }
 

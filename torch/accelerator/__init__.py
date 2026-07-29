@@ -2,22 +2,49 @@ r"""
 This package introduces support for the current :ref:`accelerator<accelerators>` in python.
 """
 
-from typing import Literal, Optional
+from functools import cache
+from typing import Any
 from typing_extensions import deprecated
 
 import torch
 
+from . import random
 from ._utils import _device_t, _get_device_index
+from .graphs import Graph
+from .memory import (
+    empty_cache,
+    empty_host_cache,
+    get_memory_info,
+    max_memory_allocated,
+    max_memory_reserved,
+    memory_allocated,
+    memory_reserved,
+    memory_stats,
+    reset_accumulated_memory_stats,
+    reset_peak_memory_stats,
+)
 
 
 __all__ = [
+    "Graph",
     "current_accelerator",
     "current_device_idx",  # deprecated
     "current_device_index",
+    "get_device_capability",
     "current_stream",
     "device_count",
     "device_index",
+    "empty_cache",
+    "empty_host_cache",
+    "get_memory_info",
     "is_available",
+    "max_memory_allocated",
+    "max_memory_reserved",
+    "memory_allocated",
+    "memory_reserved",
+    "memory_stats",
+    "reset_accumulated_memory_stats",
+    "reset_peak_memory_stats",
     "set_device_idx",  # deprecated
     "set_device_index",
     "set_stream",
@@ -33,7 +60,7 @@ def device_count() -> int:
             If there is no available accelerators, return 0.
 
     .. note:: This API delegates to the device-specific version of `device_count`.
-        On CUDA, this API will NOT posion fork if NVML discovery succeeds.
+        On CUDA, this API will NOT poison fork if NVML discovery succeeds.
         Otherwise, it will. For more details, see :ref:`multiprocessing-poison-fork-note`.
     """
     acc = current_accelerator()
@@ -45,7 +72,7 @@ def device_count() -> int:
 
 
 def is_available() -> bool:
-    r"""Check if the current accelerator is available at runtime: it was build, all the
+    r"""Check if the current accelerator is available at runtime: it was built, all the
     required drivers are available and at least one device is visible.
     See :ref:`accelerator<accelerators>` for details.
 
@@ -73,7 +100,7 @@ def is_available() -> bool:
     return mod.is_available()
 
 
-def current_accelerator(check_available: bool = False) -> Optional[torch.device]:
+def current_accelerator(check_available: bool = False) -> torch.device | None:
     r"""Return the device of the accelerator available at compilation time.
     If no accelerator were available at compilation time, returns None.
     See :ref:`accelerator<accelerators>` for details.
@@ -119,6 +146,45 @@ current_device_idx = deprecated(
     category=FutureWarning,
 )(current_device_index)
 
+current_device_idx.__doc__ = r"""
+    (Deprecated) Return the index of a currently selected device for the current :ref:`accelerator<accelerators>`.
+
+    Returns:
+        int: the index of a currently selected device.
+
+    .. warning::
+
+        :func:`torch.accelerator.current_device_idx` is deprecated in favor of :func:`torch.accelerator.current_device_index`
+        and will be removed in a future PyTorch release.
+    """
+
+
+@cache
+def get_device_capability(device: _device_t = None, /) -> dict[str, Any]:
+    r"""Return the capability of the currently selected device.
+
+    Args:
+        device (:class:`torch.device`, str, int, optional): The device to query capabilities for
+            :ref:`accelerator<accelerators>` device type. If not given,
+            use :func:`torch.accelerator.current_device_index` by default.
+
+    Returns:
+        dict[str, Any]: A dictionary containing device capability information. The dictionary includes:
+            - ``supported_dtypes`` (set(torch.dtype)): Set of PyTorch data types for which
+              tensors can be allocated on the accelerator and type conversion across
+              supported dtypes are supported. Any operator support outside of that
+              is not guaranteed
+
+    Examples:
+        >>> # xdoctest: +SKIP("requires cuda")
+        >>> # Query capabilities for current device
+        >>> capabilities = torch.accelerator.get_device_capability("cuda:0")
+        >>> print("Supported dtypes:", capabilities["supported_dtypes"])
+    """
+    device_index = _get_device_index(device, optional=True)
+    # pyrefly: ignore [missing-attribute]
+    return torch._C._accelerator_getDeviceCapability(device_index)
+
 
 def set_device_index(device: _device_t, /) -> None:
     r"""Set the current device index to a given device.
@@ -129,7 +195,7 @@ def set_device_index(device: _device_t, /) -> None:
 
     .. note:: This function is a no-op if this device index is negative.
     """
-    device_index = _get_device_index(device)
+    device_index = _get_device_index(device, optional=False)
     torch._C._accelerator_setDeviceIndex(device_index)
 
 
@@ -137,6 +203,19 @@ set_device_idx = deprecated(
     "Use `set_device_index` instead.",
     category=FutureWarning,
 )(set_device_index)
+
+set_device_idx.__doc__ = r"""
+    (Deprecated) Set the current device index to a given device.
+
+    Args:
+        device (:class:`torch.device`, str, int): a given device that must match the current
+            :ref:`accelerator<accelerators>` device type.
+
+    .. warning::
+
+        :func:`torch.accelerator.set_device_idx` is deprecated in favor of :func:`torch.accelerator.set_device_index`
+        and will be removed in a future PyTorch release.
+    """
 
 
 def current_stream(device: _device_t = None, /) -> torch.Stream:
@@ -150,7 +229,7 @@ def current_stream(device: _device_t = None, /) -> torch.Stream:
     Returns:
         torch.Stream: the currently selected stream for a given device.
     """
-    device_index = _get_device_index(device, True)
+    device_index = _get_device_index(device, optional=True)
     return torch._C._accelerator_getStream(device_index)
 
 
@@ -188,7 +267,7 @@ def synchronize(device: _device_t = None, /) -> None:
         >>> torch.accelerator.synchronize()
         >>> elapsed_time_ms = start_event.elapsed_time(end_event)
     """
-    device_index = _get_device_index(device, True)
+    device_index = _get_device_index(device, optional=True)
     torch._C._accelerator_synchronizeDevice(device_index)
 
 
@@ -216,7 +295,7 @@ class device_index:
         ...     pass
     """
 
-    def __init__(self, device: Optional[int], /) -> None:
+    def __init__(self, device: int | None, /) -> None:
         self.idx = device
         self.prev_idx = -1
 
@@ -224,7 +303,6 @@ class device_index:
         if self.idx is not None:
             self.prev_idx = torch._C._accelerator_exchangeDevice(self.idx)
 
-    def __exit__(self, *args: object) -> Literal[False]:
+    def __exit__(self, *exc_info: object) -> None:
         if self.idx is not None:
             torch._C._accelerator_maybeExchangeDevice(self.prev_idx)
-        return False

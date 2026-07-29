@@ -84,7 +84,8 @@ def main():
                 noise_margin=float(row[3]),
             )
             key = (entry.benchmark_name, entry.metric_name)
-            assert key not in expected_data, f"Duplicate entry for {key}"
+            if key in expected_data:
+                raise AssertionError(f"Duplicate entry for {key}")
             expected_data[key] = entry
 
     # Read result data file.
@@ -100,7 +101,8 @@ def main():
             )
 
             key = (entry.benchmark_name, entry.metric_name)
-            assert key not in result_data, f"Duplicate entry for {key}"
+            if key in result_data:
+                raise AssertionError(f"Duplicate entry for {key}")
             result_data[key] = entry
 
     fail = False
@@ -132,10 +134,10 @@ def main():
             )
 
         new_entry = copy.deepcopy(entry)
-        # only change if abs(ratio) > entry.noise_margin /3.
+        # only change if abs(ratio) > entry.noise_margin /5.
         new_entry.expected_value = (
             replace_with_zeros(result)
-            if abs(ratio) > entry.noise_margin * 100 / 3
+            if abs(ratio) > entry.noise_margin * 100 / 5
             else entry.expected_value
         )
         new_expected[key] = new_entry

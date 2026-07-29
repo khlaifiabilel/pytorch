@@ -23,7 +23,7 @@ class TestAliasAnalysis(JitTestCase):
         graph = parse_ir(graph_str)
         alias_db = graph.alias_db()
         split_node = graph.findNode("aten::split")
-        # split input enters wildcard set, list initalized as containing wildcard set
+        # split input enters wildcard set, list initialized as containing wildcard set
         self.assertTrue(
             alias_db.may_contain_alias(next(split_node.inputs()), split_node.output())
         )
@@ -39,7 +39,6 @@ class TestAliasAnalysis(JitTestCase):
             return [y]
 
         graph = foo.graph
-        graph.alias_db()
         alias_db = graph.alias_db()
         ten_construct = graph.findNode("aten::rand").output()
         output = next(graph.outputs())

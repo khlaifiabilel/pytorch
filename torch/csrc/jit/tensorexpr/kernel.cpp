@@ -330,8 +330,9 @@ bool mkldnnPrepackedConvIsSupportedJit(const torch::jit::Node* node) {
       _pair_int(*pad),
       _pair_int(*dilation),
       groups->toInt());
-#endif
+#else
   return false;
+#endif
 }
 
 bool isConv2d(const Node* node) {
@@ -568,7 +569,7 @@ static bool constZeroDimTensorAsScalarArg(
       std::stringstream ss;
       ss << "Unsupported tensor dtype:" << dtype
          << " for converting constant 0-dim Tensor to scalar" << '\n';
-      throw unsupported_dtype(ss.str());
+      throw unsupported_dtype(std::move(ss).str());
   }
 }
 
@@ -795,7 +796,7 @@ static void parallelizeOuterLoops(LoopNest& l, const Bufs& bufs) {
 StmtPtr TensorExprKernel::transformLoops(BackendType backendType, StmtPtr st) {
   torch::jit::tensorexpr::LoopNest l(std::move(st), bufOutputs_);
   LoopNest::sanitizeNames(l.root_stmt());
-  GRAPH_DEBUG("Original Stmt:\n", std::to_string(l.root_stmt()), "\n");
+  GRAPH_DEBUG("Original Stmt:\n", std::to_string(l.root_stmt()), '\n');
   int64_t random_tr_seed = randomTransformsRequested();
   if (random_tr_seed) {
     if (random_tr_seed == -1)
@@ -939,7 +940,7 @@ StmtPtr TensorExprKernel::transformLoops(BackendType backendType, StmtPtr st) {
   StmtPtr stmt = l.root_stmt();
   // Arithmetic Simplification.
   stmt = IRSimplifier::simplify(stmt);
-  GRAPH_DEBUG("Final Stmt:\n", std::to_string(stmt), "\n");
+  GRAPH_DEBUG("Final Stmt:\n", std::to_string(stmt), '\n');
   return stmt;
 }
 
@@ -996,7 +997,7 @@ void TensorExprKernel::genInputDebugNames() {
     std::string sanitized_name = sanitizeName(input->debugName());
     // we could get fancier here, but name conflict is extremely unlikely
     while (name_set.count(sanitized_name)) {
-      sanitized_name.append("_");
+      sanitized_name.push_back('_');
     }
     value_to_name[input] = sanitized_name;
     name_set.insert(sanitized_name);
@@ -1263,11 +1264,11 @@ Tensor TensorExprKernel::convertSymbolicOutputToCorrectStrides(
     const std::vector<size_t>& sorted_stride_indices_descending,
     const std::vector<ExprPtr>& strides,
     BufPtr& buf) {
-  // We need to convert the output tensor so that its values are layed
+  // We need to convert the output tensor so that its values are laid
   // so that when viewed from the output strides the values are correct.
-  // A contiguous Tensor of size(2, 3) with values 0-5 is layed out as:
+  // A contiguous Tensor of size(2, 3) with values 0-5 is laid out as:
   // [0] [1] [2] [3] [4] [5]
-  // The same valued tensor with strides (1, 2) would be layed out like
+  // The same valued tensor with strides (1, 2) would be laid out like
   // [0] [3] [1] [4] [2] [5]
   // When we are doing the re-ordering of values into the output tensor,
   // we are iterating per-element of the input, and we are fixed
@@ -1275,7 +1276,7 @@ Tensor TensorExprKernel::convertSymbolicOutputToCorrectStrides(
   // `val` we want here is equal to the indices for the output
   // tensor that would have given the same position as the output
   // The position is equal to the sum of stride[i] * index[i],
-  // and we can can calculate the equivalent indices in the
+  // and we can calculate the equivalent indices in the
   // output tensor strides by iteratively computing the index of
   // the biggest stride:
   // absolute = ...
@@ -1378,7 +1379,7 @@ Tensor TensorExprKernel::convertStaticShapeOutputToCorrectStrides(
       tt->strides().concrete_sizes(),
       buildErrorMessage("Output strides are unknown."));
   const std::vector<int64_t> strides = *tt->strides().concrete_sizes();
-  // All Tensors in NNC are layed out in default, contiguous layout.
+  // All Tensors in NNC are laid out in default, contiguous layout.
   // If the output is also default contiguous we don't need to do anything
   if (strides == default_strides) {
     return Tensor(buf, nullptr);
@@ -1482,7 +1483,7 @@ std::vector<BufPtr> TensorExprKernel::preAllocIntermediateBufs(
       remaining_interm_bufs.push_back(buf);
       continue;
     }
-    auto bp = (void*)malloc(size);
+    auto bp = malloc(size);
     if (!bp) {
       remaining_interm_bufs.push_back(buf);
       continue;

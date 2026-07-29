@@ -1,19 +1,20 @@
 # mypy: allow-untyped-defs
 import logging
 from collections.abc import Sequence
+from functools import partial
+from pathlib import Path
 from typing import Any
-
-import sympy
 
 import torch
 from torch._inductor.select_algorithm import realize_inputs, SymbolicGridFn
-from torch._inductor.utils import sympy_product
+from torch._inductor.utils import get_current_backend, sympy_product
 from torch._inductor.virtualized import V
+from torch.fx.experimental.symbolic_shapes import has_free_unbacked_symbols
 
-from .. import config as inductor_config
+from .. import config
 from ..codegen.wrapper import PythonWrapperCodegen
 from ..ir import _IntLike, Layout, TensorBox
-from ..utils import get_num_sms, TMA_DESCRIPTOR_SIZE
+from ..utils import load_template, triton_type
 
 
 log = logging.getLogger(__name__)
@@ -46,97 +47,9 @@ def persistent_grouped_mm_grid(*args):
 def acc_type(dtype):
     if dtype in (torch.float16, torch.bfloat16):
         return "tl.float32"
-    return f"tl.{dtype}".replace("torch.", "")
-
-
-def mm_options(config, sym_m, sym_n, sym_k, layout):
-    """
-    Common options to matmul triton templates.
-    """
-    even_k_symbolic = (
-        # it isn't worth guarding on this
-        sympy.gcd(sym_k, config.kwargs["BLOCK_K"]) == config.kwargs["BLOCK_K"]
-    )
-    allow_tf32 = torch.backends.cuda.matmul.allow_tf32 and (
-        not inductor_config.force_same_precision
-        or ((sym_m % 16) == 0 and (sym_n % 16) == 0 and (sym_k % 8) == 0)
-    )
-    options_dict = dict(
-        EVEN_K=even_k_symbolic,
-        ALLOW_TF32=allow_tf32,
-        USE_FAST_ACCUM=False,  # Option for _scaled_mm
-        ACC_TYPE=acc_type(layout.dtype),
-        num_stages=config.num_stages,
-        num_warps=config.num_warps,
-        **config.kwargs,
-    )
-
-    # If GROUP_M not specified then default to 8
-    if "GROUP_M" not in config.kwargs:
-        group_m = config.kwargs.get("GROUP_M", 8)
-        options_dict["GROUP_M"] = group_m
-
-    return options_dict
-
-
-def tma_options() -> dict[str, Any]:
-    from torch.utils._triton import has_triton_stable_tma_api
-
-    return {"TMA_EXPERIMENTAL_API": not has_triton_stable_tma_api()}
-
-
-def persistent_mm_options(mat1, mat2):
-    res = dict(
-        A_ROW_MAJOR=not mat1.layout.is_transposed(),
-        B_ROW_MAJOR=not mat2.layout.is_transposed(),
-        NUM_SMS=get_num_sms(),
-        TMA_SIZE=TMA_DESCRIPTOR_SIZE,
-    )
-    res.update(tma_options())
-    return res
-
-
-def scaled_mm_options(  # type: ignore[no-untyped-def]
-    config,  # triton.Config
-    sym_m: sympy.core.numbers.Integer,
-    sym_n: sympy.core.numbers.Integer,
-    sym_k: sympy.core.numbers.Integer,
-    layout: Layout,
-    scale_a,
-    scale_b,
-    use_fast_accum: bool,
-    device_tma: bool = False,
-) -> dict[str, Any]:
-    def are_compatible_scales(size_a, size_b) -> bool:
-        # Same sized scales are compatable
-        if len(size_a) == len(size_b):
-            return True
-
-        # Both need to be scalars or len(1) tensors
-        if len(size_a) <= 1 and len(size_b) <= 1:
-            return True
-
-        return False
-
-    size_a, size_b = scale_a.get_size(), scale_b.get_size()
-    assert are_compatible_scales(size_a, size_b), (
-        "Expect scale_a and scale_b to be either both scalars (including single-element tensors) "
-        f"or 1-dimensional tensors with the same size. Got scale_a: {len(size_a)} and scale_b: {len(size_b)}."
-    )
-
-    mm_template_options = mm_options(config, sym_m, sym_n, sym_k, layout)
-
-    mm_template_options["ACC_TYPE"] = "tl.float32"
-    mm_template_options["USE_FAST_ACCUM"] = use_fast_accum
-    mm_template_options["SCALING_ROWWISE"] = len(size_a) == 2
-
-    if device_tma:
-        mm_template_options["TMA_SIZE"] = TMA_DESCRIPTOR_SIZE
-        mm_template_options["NUM_SMS"] = get_num_sms()
-
-    mm_template_options.update(tma_options())
-
-    return mm_template_options
+    if dtype.is_floating_point and dtype.itemsize == 1:  # fp8 dtypes
+        return "tl.float32"
+    return triton_type(dtype)
 
 
 def mm_args(
@@ -157,10 +70,10 @@ def mm_args(
         *b2, n, k2 = mat2.get_size()
     else:
         *b2, k2, n = mat2.get_size()
-    b = [V.graph.sizevars.check_equals(a, b) for a, b in zip(b1, b2)]
+    b = [V.graph.sizevars.check_equals_and_simplify(a, b) for a, b in zip(b1, b2)]
     if use_4x2_dim:
         k2 = k2 * 2
-    k = V.graph.sizevars.check_equals(k1, k2)
+    k = V.graph.sizevars.check_equals_and_simplify(k1, k2)
     if layout is None:
         from torch._inductor.ir import FixedLayout
 
@@ -173,21 +86,13 @@ def mm_args(
             [*b, m, n],
         )
     else:
-        assert out_dtype is None, "out_dtype is ignored if layout is specified."
+        if out_dtype is not None:
+            raise AssertionError("out_dtype is ignored if layout is specified.")
     from ..lowering import expand
 
     others = [realize_inputs(expand(x, layout.size)) for x in others]
 
     return [m, n, k, layout, mat1, mat2, *others]
-
-
-def mm_config_kwargs(device, exclude_condition):
-    if device == "cpu":
-        return {
-            "scale": 0.5,
-            "exclude": exclude_condition,
-        }
-    return {}
 
 
 def addmm_epilogue(dtype, alpha, beta):
@@ -227,6 +132,86 @@ def scale_mm_epilogue():
             return mul_acc
 
     return epilogue
+
+
+def use_native_matmul(mat1, mat2):
+    if not config.triton.native_matmul:
+        return False
+
+    # If tma matmul is on, don't do native matmul
+    if (
+        config.triton.enable_persistent_tma_matmul
+        and torch.utils._triton.has_triton_tma_device()
+    ):
+        raise AssertionError("native matmul doesn't support tma codegen yet")
+
+    # Currently only enable native matmul for default indexing
+    # TODO : support block ptr
+    if config.triton.use_block_ptr:
+        raise AssertionError("native matmul doesn't support block_ptr codegen yet")
+
+    # Currently only enable native matmul for triton on GPU.
+    device_type = mat1.get_device().type
+    if not (
+        device_type in ("cuda", "xpu") and get_current_backend(device_type) == "triton"
+    ):
+        return False
+
+    # Currently, tl.dot only supports following dtypes
+    triton_supported_dtype = [
+        torch.int8,
+        torch.uint8,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ]
+    if mat1.dtype not in triton_supported_dtype:
+        return False
+    if mat2.dtype not in triton_supported_dtype:
+        return False
+
+    # (..., M, K) @ (..., K, N)
+    m, k, n = mat1.get_size()[-2], mat1.get_size()[-1], mat2.get_size()[-1]
+
+    # If the shape has unbacked symbols, don't do native matmul.
+    # This is related to the behavior of statically_known_multiple_of on unbacked symints.
+    # Since statically_known_multiple_of just returns False for unbacked symbols
+    # due to the expensive cost, codegen fails when there is a unbacked symbol.
+    # In particular, it fails at _split_iteration_ranges in codegen/simd.py.
+    # See this : https://github.com/pytorch/pytorch/pull/131649
+    if any(map(has_free_unbacked_symbols, [m, k, n])):
+        return False
+
+    # Consider the shape (m,k,n) > 1
+    # TODO : support when size = 1
+    if (
+        V.graph.sizevars.statically_known_leq(m, 1)
+        or V.graph.sizevars.statically_known_leq(k, 1)
+        or V.graph.sizevars.statically_known_leq(n, 1)
+    ):
+        return False
+
+    return True
+
+
+def _use_small_mm_pointwise(m, k, n, layout) -> bool:
+    """Check if mm should be lowered to pointwise ops for small K and N.
+
+    For very small inner dimensions (K < 5 and N < 5) with M >= 64,
+    cuBLAS launch overhead dominates and a fused pointwise kernel is
+    faster (1.2-4.8x on H200).  M >= 64 excludes tiny matrices where
+    pointwise kernel launch overhead negates the benefit.  K,N < 5
+    avoids shapes where Triton codegen quality is unstable (K=5 regresses
+    at large M due to reduction-dimension alignment).  Disabled under
+    max_autotune to preserve template selection.
+    See https://github.com/pytorch/pytorch/issues/186348
+    """
+    if config.max_autotune or config.max_autotune_gemm:
+        return False
+    if layout.device.type in ("cpu", "mps"):
+        return False
+    skt = V.graph.sizevars.statically_known_true
+    return skt(m >= 64) and skt(k < 5) and skt(n < 5)
 
 
 def _is_static_problem(layout: Layout) -> tuple[bool, bool]:
@@ -283,15 +268,20 @@ def check_supported_striding(mat_a: TensorBox, mat_b: TensorBox) -> None:
     )
 
 
-def is_batch_stride_largest(mat1, mat2, layout) -> bool:
+def is_batch_stride_largest_or_zero(mat1, mat2, layout) -> bool:
     """
     Checking if the batch stride is the largest in the stride.
     """
     sizes = [mat1.get_size(), mat2.get_size(), layout.size]
     strides = [mat1.get_stride(), mat2.get_stride(), layout.stride]
     for size, stride in zip(sizes, strides):
-        assert len(size) == len(stride) == 3, "Expect 3D tensors"
-        if stride[0] != sympy_product(size[1:]):
+        if not (len(size) == len(stride) == 3):
+            raise AssertionError("Expect 3D tensors")
+        if stride[0] != 0 and stride[0] != sympy_product(size[1:]):
             return False
 
     return True
+
+
+_KERNEL_TEMPLATE_DIR = Path(__file__).parent / "templates"
+load_kernel_template = partial(load_template, template_dir=_KERNEL_TEMPLATE_DIR)

@@ -14,8 +14,12 @@ import torch.distributed.tensor as dt
 import torch.distributed.tensor.debug
 
 
-assert int(os.getenv("WORLD_SIZE", "1")) >= 4, "We need at least 4 devices"
+if int(os.getenv("WORLD_SIZE", "1")) < 4:
+    raise AssertionError("We need at least 4 devices")
 rank = int(os.environ["RANK"])
+
+
+device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
 
 
 def section(msg: str) -> None:
@@ -31,7 +35,7 @@ def visualize(t: dt.DTensor, msg: str = "") -> None:
 
 
 section("[bold]1D Tensor; 1D Mesh[/bold]")
-m = dist.init_device_mesh("cuda", (4,))
+m = dist.init_device_mesh(device_type, (4,))
 t = torch.ones(4)
 visualize(
     dt.distribute_tensor(t, m, [dt.Replicate()]),
@@ -43,7 +47,7 @@ visualize(
 )
 
 section("[bold]2D Tensor; 1D Mesh[/bold]")
-m = dist.init_device_mesh("cuda", (4,))
+m = dist.init_device_mesh(device_type, (4,))
 t = torch.ones(4, 4)
 visualize(
     dt.distribute_tensor(t, m, [dt.Replicate()]),
@@ -59,7 +63,7 @@ visualize(
 )
 
 section("[bold]1D Tensor; 2D Mesh[/bold]")
-m = dist.init_device_mesh("cuda", (2, 2))
+m = dist.init_device_mesh(device_type, (2, 2))
 t = torch.ones(4)
 visualize(
     dt.distribute_tensor(t, m, [dt.Replicate(), dt.Replicate()]),
@@ -79,7 +83,7 @@ visualize(
 )
 
 section("[bold]2D Tensor; 2D Mesh[/bold]")
-m = dist.init_device_mesh("cuda", (2, 2))
+m = dist.init_device_mesh(device_type, (2, 2))
 t = torch.ones(4, 4)
 visualize(
     dt.distribute_tensor(t, m, [dt.Replicate(), dt.Replicate()]),

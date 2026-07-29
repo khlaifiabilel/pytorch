@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, cast, Optional, Union
+from typing import Any, cast
 
 import requests
 
@@ -100,7 +103,7 @@ def check_issue_open() -> bool:
         return False
 
 
-def get_workflow_id(run_id: str) -> Optional[str]:
+def get_workflow_id(run_id: str) -> str | None:
     # Get the workflow ID that corresponds to the file for the run ID
     url = f"https://api.github.com/repos/pytorch/pytorch/actions/runs/{run_id}"
     response = query_github_api(url)
@@ -132,17 +135,26 @@ def check_changed_files(sha: str) -> bool:
     # Return true if all the changed files are in the list of allowed files to
     # be changed to reuse the old whl
 
-    # Removing any files is not allowed since rysnc will not remove files
+    # Removing files in the torch folder is not allowed since rsync will not
+    # remove files
     removed_files = (
         subprocess.check_output(
-            ["git", "diff", "--name-only", sha, "HEAD", "--diff-filter=D"],
+            [
+                "git",
+                "diff",
+                "--name-only",
+                sha,
+                "HEAD",
+                "--diff-filter=D",
+                "--no-renames",
+            ],
             text=True,
             stderr=subprocess.DEVNULL,
         )
         .strip()
         .split()
     )
-    if removed_files:
+    if any(file.startswith("torch/") for file in removed_files):
         print(
             f"Removed files between {sha} and HEAD: {removed_files}, cannot reuse old whl"
         )
@@ -150,7 +162,7 @@ def check_changed_files(sha: str) -> bool:
 
     changed_files = (
         subprocess.check_output(
-            ["git", "diff", "--name-only", sha, "HEAD"],
+            ["git", "diff", "--name-only", sha, "HEAD", "--no-renames"],
             text=True,
             stderr=subprocess.DEVNULL,
         )
@@ -219,13 +231,13 @@ def unzip_artifact_and_replace_files() -> None:
         old_version = f"+git{path.stem.split('+')[1].split('-')[0][3:]}"
         new_version = f"+git{head_sha[:7]}"
 
-        def rename_to_new_version(file: Union[str, Path]) -> None:
+        def rename_to_new_version(file: str | Path) -> None:
             # Rename file with old_version to new_version
             subprocess.check_output(
                 ["mv", file, str(file).replace(old_version, new_version)]
             )
 
-        def change_content_to_new_version(file: Union[str, Path]) -> None:
+        def change_content_to_new_version(file: str | Path) -> None:
             # Check if is a file
             if os.path.isdir(file):
                 return
@@ -247,15 +259,15 @@ def unzip_artifact_and_replace_files() -> None:
         # Remove the old wheel (which is now a zip file)
         os.remove(zip_path)
 
-        # Copy python files into the artifact
-        subprocess.check_output(
-            ["rsync", "-avz", "torch", f"artifacts/dist/{old_stem}"],
-        )
+        # Copy python files into the artifact. Use shutil rather than rsync so
+        # the script works on container images that don't ship rsync (e.g. the
+        # OSDC ARC builder image).
+        shutil.copytree("torch", f"artifacts/dist/{old_stem}/torch", dirs_exist_ok=True)
 
         change_content_to_new_version(f"artifacts/dist/{old_stem}/torch/version.py")
 
         for file in Path(f"artifacts/dist/{old_stem}").glob(
-            "*.dist-info/**",
+            "*.dist-info/*",
         ):
             change_content_to_new_version(file)
 
@@ -295,8 +307,7 @@ def unzip_artifact_and_replace_files() -> None:
 
 
 def set_output() -> None:
-    # Disable for now so we can monitor first
-    # pass
+    print("Setting output reuse=true")
     if os.getenv("GITHUB_OUTPUT"):
         with open(str(os.getenv("GITHUB_OUTPUT")), "a") as env:
             print("reuse=true", file=env)

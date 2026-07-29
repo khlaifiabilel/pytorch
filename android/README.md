@@ -2,7 +2,7 @@
 
 ## Demo applications and tutorials
 
-Please refer to [pytorch-labs/executorch-examples](https://github.com/pytorch-labs/executorch-examples/tree/main/dl3/android/DeepLabV3Demo) for the Android demo app based on [ExecuTorch](https://github.com/pytorch/executorch).
+Please refer to [meta-pytorch/executorch-examples](https://github.com/meta-pytorch/executorch-examples/tree/main/dl3/android/DeepLabV3Demo) for the Android demo app based on [ExecuTorch](https://github.com/pytorch/executorch).
 
 Please join our [Discord](https://discord.com/channels/1334270993966825602/1349854760299270284) for any questions.
 
@@ -31,13 +31,13 @@ dependencies {
 
 ##### Nightly
 
-Nightly(snapshots) builds are published every night from `master` branch to [nexus sonatype snapshots repository](https://oss.sonatype.org/#nexus-search;quick~pytorch_android)
+Nightly(snapshots) builds are published every night from `master` branch to the [Sonatype Central snapshots repository](https://central.sonatype.com/repository/maven-snapshots/)
 
 To use them repository must be specified explicitly:
 ```groovy
 repositories {
     maven {
-        url "https://oss.sonatype.org/content/repositories/snapshots"
+        url "https://central.sonatype.com/repository/maven-snapshots/"
     }
 }
 

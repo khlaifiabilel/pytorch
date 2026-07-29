@@ -6,7 +6,7 @@ from collections import defaultdict
 from collections.abc import Generator
 from contextlib import contextmanager
 from itertools import chain
-from typing import Any, Optional
+from typing import Any
 
 from torch.utils._appending_byte_serializer import (
     AppendingByteSerializer,
@@ -41,15 +41,13 @@ class CacheArtifact(ABC):
 
     @staticmethod
     def encode(content: Any) -> bytes:
-        assert isinstance(content, bytes), f"Expected bytes, got {type(content)}"
+        if not isinstance(content, bytes):
+            raise AssertionError(f"Expected bytes, got {type(content)}")
         return content
 
     @abstractmethod
     def populate_cache(self) -> None:
         pass
-
-    def precompile_compatible(self) -> bool:
-        return False
 
     @staticmethod
     def type() -> str:
@@ -72,9 +70,10 @@ class CacheArtifactFactory:
     @classmethod
     def register(cls, artifact_cls: type[CacheArtifact]) -> type[CacheArtifact]:
         artifact_type_key = artifact_cls.type()
-        assert (
-            artifact_cls.type() not in cls._artifact_types
-        ), f"Artifact of type={artifact_type_key} already registered in mega-cache artifact factory"
+        if artifact_cls.type() in cls._artifact_types:
+            raise AssertionError(
+                f"Artifact of type={artifact_type_key} already registered in mega-cache artifact factory"
+            )
         cls._artifact_types[artifact_type_key] = artifact_cls
         setattr(
             CacheInfo,
@@ -85,14 +84,16 @@ class CacheArtifactFactory:
 
     @classmethod
     def _get_artifact_type(cls, artifact_type_key: str) -> type[CacheArtifact]:
-        assert (
-            artifact_type_key in cls._artifact_types
-        ), f"Artifact of type={artifact_type_key} not registered in mega-cache artifact factory"
+        if artifact_type_key not in cls._artifact_types:
+            raise AssertionError(
+                f"Artifact of type={artifact_type_key} not registered in mega-cache artifact factory"
+            )
         return cls._artifact_types[artifact_type_key]
 
     @classmethod
     def create(cls, artifact_type_key: str, key: str, content: bytes) -> CacheArtifact:
         artifact_cls = cls._get_artifact_type(artifact_type_key)
+        # pyrefly: ignore [bad-instantiation]
         return artifact_cls(key, content)
 
     @classmethod
@@ -100,6 +101,7 @@ class CacheArtifactFactory:
         cls, artifact_type_key: str, key: str, content: Any
     ) -> CacheArtifact:
         artifact_cls = cls._get_artifact_type(artifact_type_key)
+        # pyrefly: ignore [bad-instantiation]
         return artifact_cls(key, artifact_cls.encode(content))
 
 
@@ -132,7 +134,7 @@ class CacheInfo:
         ...
 
     @property
-    def precompile_aot_autograd_artifacts(self) -> list[str]:  # type: ignore[empty-body]
+    def precompile_artifacts(self) -> list[str]:  # type: ignore[empty-body]
         ...
 
     def add(self, artifact: CacheArtifact) -> None:
@@ -169,6 +171,23 @@ def _deserialize_single_cache(
 CacheArtifactsResult = dict[str, list[CacheArtifact]]
 
 
+@dataclasses.dataclass(frozen=True)
+class CacheArtifactRecorder:
+    """
+    Shared entry point for cache implementations to record artifacts.
+    """
+
+    artifact_type: str
+    key: str
+
+    def record(self, content: Any) -> None:
+        CacheArtifactManager.record_artifact(self.artifact_type, self.key, content)
+
+    def record_if_present(self, content: Any | None) -> None:
+        if content is not None:
+            self.record(content)
+
+
 class CacheArtifactManager:
     """
     Lightweight manager class for collecting and processing cache artifacts for
@@ -176,27 +195,27 @@ class CacheArtifactManager:
 
     Intended Lifecycle:
     - Execute code via torch.compile, this will call
-        CacheArtifactManager.record_artifact on each cache artifact
+        CacheArtifactRecorder.record on each cache artifact
     - Call CacheArtifactManager.serialize to convert all the cache artifacts
         to portable format
     - Call CacheArtifactManager.deserialize to hot load the cache artifacts on
         a potentially different process
 
-    NOTE: There's no FB/FC guarentees, results of cache artifacts will not be
+    NOTE: There's no FB/FC guarantees, results of cache artifacts will not be
           used unless code version matches.
     """
 
     # Protected by the compile_lock
     _new_cache_artifacts: CacheArtifactsResult = defaultdict(list)
-    # Keep a seperate seen artifacts list to make avoid unnecessary duplicates
+    # Keep a separate seen artifacts list to avoid unnecessary duplicates
     # This list will not be cleared between serialize() calls
     _seen_artifacts: OrderedSet[CacheArtifact] = OrderedSet()
     # When serialize() is called, artifacts are transferred from _cache_artifacts to
     # internal data structure of the _serializer
     # This allows us to only pay the cost of serialization if serialize() is called
-    _serializer: AppendingByteSerializer[
-        tuple[str, list[CacheArtifact]]
-    ] = AppendingByteSerializer(serialize_fn=_serialize_single_cache)
+    _serializer: AppendingByteSerializer[tuple[str, list[CacheArtifact]]] = (
+        AppendingByteSerializer(serialize_fn=_serialize_single_cache)
+    )
     _cache_info: CacheInfo = CacheInfo()
 
     @classmethod
@@ -240,7 +259,7 @@ class CacheArtifactManager:
         artifact = CacheArtifactFactory.encode_create(artifact_type, key, content)
         if artifact in cls._seen_artifacts:
             return
-        log.debug("Recording %s", str(artifact))
+        log.debug("Recording %s", artifact)
         cls._new_cache_artifacts[artifact_type].append(artifact)
         cls._seen_artifacts.add(artifact)
 
@@ -252,7 +271,7 @@ class CacheArtifactManager:
         return len(cls._new_cache_artifacts) != 0
 
     @classmethod
-    def serialize(cls) -> Optional[tuple[bytes, CacheInfo]]:
+    def serialize(cls) -> tuple[bytes, CacheInfo] | None:
         """
         Converts the "mega" list into portable format
         """
@@ -261,7 +280,7 @@ class CacheArtifactManager:
             cls._cache_info.add(artifact)
 
         if cls._cache_info.empty():
-            # If there are not artifacts, dont just return bytes with
+            # If there are no artifacts, don't just return bytes with
             # version.
             return None
 
@@ -278,7 +297,7 @@ class CacheArtifactManager:
         return None
 
     @staticmethod
-    def deserialize(serialized_artifacts: bytes) -> Optional[CacheArtifactsResult]:
+    def deserialize(serialized_artifacts: bytes) -> CacheArtifactsResult | None:
         """
         Converts the portable format back into CacheArtifacts
         """
@@ -312,6 +331,7 @@ class CacheArtifactManager:
         cache artifacts are registered in the cache registry. This is done by
         simply importing all the cache artifacts already wrapped with register call.
         """
+        from torch._dynamo.package import PrecompileCacheArtifact  # noqa: F401
         from torch._dynamo.pgo import PGOCacheArtifact  # noqa: F401
         from torch._functorch._aot_autograd.autograd_cache import (  # noqa: F401
             AOTAutogradCacheArtifact,
